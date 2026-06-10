@@ -21,6 +21,7 @@ import {
   sleep,
   buildWorkVolume,
   skipCpHashVerify,
+  formatResourceUsageReport,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -1031,6 +1032,80 @@ export async function getPodByName(name): Promise<k8s.V1Pod> {
     name,
     namespace: namespace()
   })
+}
+
+// Exec a command in a pod container and capture its stdout as a string.
+async function execPodCaptureStdout(
+  command: string[],
+  podName: string,
+  containerName: string
+): Promise<string> {
+  const exec = new k8s.Exec(kc)
+  let output = ''
+  const outStream = new stream.Writable({
+    write(chunk, _enc, cb) {
+      output += chunk.toString('utf8')
+      cb()
+    }
+  })
+  await new Promise<void>((resolve, reject) => {
+    exec
+      .exec(
+        namespace(),
+        podName,
+        containerName,
+        command,
+        outStream,
+        process.stderr,
+        null,
+        false,
+        resp => {
+          if (resp.status === 'Success') {
+            resolve()
+          } else {
+            reject(new Error(resp?.message || 'exec failed'))
+          }
+        }
+      )
+      .catch(reject)
+  })
+  outStream.end()
+  return output
+}
+
+// Read the job container's cgroup peak memory (and cumulative CPU) and log it
+// against the configured limit. Must be called while the container is still
+// alive (i.e. before prunePods). Best-effort: any failure is swallowed with a
+// debug note so it can never break job cleanup. Supports cgroup v2 (modern,
+// memory.peak) and v1 (memory.max_usage_in_bytes), with a graceful "n/a" when
+// the kernel exposes no peak counter.
+export async function reportPeakResourceUsage(podName: string): Promise<void> {
+  const script = `
+if [ -r /sys/fs/cgroup/memory.peak ]; then echo "mem_peak=$(cat /sys/fs/cgroup/memory.peak)"; \
+elif [ -r /sys/fs/cgroup/memory/memory.max_usage_in_bytes ]; then echo "mem_peak=$(cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes)"; \
+else echo "mem_peak=na"; fi
+if [ -r /sys/fs/cgroup/memory.max ]; then echo "mem_limit=$(cat /sys/fs/cgroup/memory.max)"; \
+elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then echo "mem_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"; \
+else echo "mem_limit=na"; fi
+if [ -r /sys/fs/cgroup/cpu.stat ]; then echo "cpu_usec=$(awk '/^usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat)"; \
+elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then echo "cpu_nsec=$(cat /sys/fs/cgroup/cpuacct/cpuacct.usage)"; \
+else echo "cpu_usec=na"; fi
+`
+  let raw: string
+  try {
+    raw = await execPodCaptureStdout(
+      ['sh', '-c', script],
+      podName,
+      JOB_CONTAINER_NAME
+    )
+  } catch (err) {
+    core.debug(
+      `[usage] could not read cgroup stats: ${(err as Error)?.message ?? err}`
+    )
+    return
+  }
+
+  core.info(`[usage] ${formatResourceUsageReport(raw)}`)
 }
 
 // Resolve the PV currently bound to a PVC by reading the PVC's volumeName.

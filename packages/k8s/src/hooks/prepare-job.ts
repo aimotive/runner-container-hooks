@@ -21,6 +21,7 @@ import {
   CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
+  formatResourceMap,
   generateContainerName,
   mergeContainerWithOptions,
   readExtensionFromFile,
@@ -81,6 +82,12 @@ export async function prepareJob(
         ? `, services: ${services.map(s => s.image).join(', ')}`
         : '')
   )
+  if (container) {
+    core.info(
+      `[resources] job container requests: ${formatResourceMap(container.resources?.requests)} | ` +
+        `limits: ${formatResourceMap(container.resources?.limits)}`
+    )
+  }
   try {
     createdPod = await createJobPod(
       getJobPodName(),

@@ -40,6 +40,92 @@ export function releaseWorkVolumePvEnabled(): boolean {
   return process.env[ENV_RELEASE_WORK_VOLUME_PV] === 'true'
 }
 
+export const ENV_REPORT_RESOURCE_USAGE = 'ACTIONS_RUNNER_REPORT_RESOURCE_USAGE'
+
+// When true, the cleanup-job hook reads the job container's cgroup peak memory
+// (and cumulative CPU) just before the pod is torn down and logs it, so the
+// GitHub UI shows actual peak usage against the configured limits. Useful for
+// right-sizing the podTemplate resources.
+export function reportResourceUsageEnabled(): boolean {
+  return process.env[ENV_REPORT_RESOURCE_USAGE] === 'true'
+}
+
+// Render a Kubernetes resources map (requests/limits) as a compact one-liner,
+// e.g. "cpu=4 memory=5Gi". Values may arrive as numbers or strings.
+export function formatResourceMap(map?: { [key: string]: unknown }): string {
+  if (!map || !Object.keys(map).length) {
+    return '(none)'
+  }
+  return Object.entries(map)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(' ')
+}
+
+// Turn the raw cgroup stdout (mem_peak=.., mem_limit=.., cpu_usec=../cpu_nsec=..)
+// into a single human-readable usage line. Pure so it can be unit-tested
+// independently of the in-cluster exec.
+export function formatResourceUsageReport(raw: string): string {
+  const fields: { [k: string]: string } = {}
+  for (const line of raw.split('\n')) {
+    const idx = line.indexOf('=')
+    if (idx > 0) {
+      fields[line.slice(0, idx).trim()] = line.slice(idx + 1).trim()
+    }
+  }
+
+  const memPeak = Number(fields['mem_peak'])
+  // cgroup v1 reports an unlimited memory limit as a huge sentinel; treat
+  // anything implausibly large (or the v2 literal "max") as "no limit".
+  const memLimitRaw = fields['mem_limit']
+  const memLimit = Number(memLimitRaw)
+  const hasLimit =
+    Number.isFinite(memLimit) &&
+    memLimitRaw !== 'max' &&
+    memLimit < 1024 ** 5 // < 1Pi → a real limit
+
+  let memMsg: string
+  if (Number.isFinite(memPeak)) {
+    const peakStr = formatBytes(memPeak)
+    if (hasLimit) {
+      const pct = Math.round((memPeak / memLimit) * 100)
+      memMsg = `peak memory: ${peakStr} / ${formatBytes(memLimit)} limit (${pct}%)`
+    } else {
+      memMsg = `peak memory: ${peakStr} (no limit)`
+    }
+  } else {
+    memMsg = 'peak memory: n/a (no cgroup peak counter on this kernel)'
+  }
+
+  let cpuMsg = ''
+  const cpuSec =
+    fields['cpu_usec'] && fields['cpu_usec'] !== 'na'
+      ? Number(fields['cpu_usec']) / 1e6
+      : fields['cpu_nsec']
+        ? Number(fields['cpu_nsec']) / 1e9
+        : NaN
+  if (Number.isFinite(cpuSec)) {
+    cpuMsg = ` | cpu: ${Math.round(cpuSec * 10) / 10}s total`
+  }
+
+  return `${memMsg}${cpuMsg}`
+}
+
+// Human-readable bytes (binary units). Returns undefined for non-finite input.
+export function formatBytes(bytes: number): string | undefined {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return undefined
+  }
+  const units = ['B', 'Ki', 'Mi', 'Gi', 'Ti']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  const rounded = unit === 0 ? value : Math.round(value * 10) / 10
+  return `${rounded}${units[unit]}`
+}
+
 // When the work volume is a large, reused persistent volume, the per-copy
 // integrity safeguards in execCpToPod/execCpFromPod walk the entire /__w tree
 // file-by-file (a `find ... -exec stat` hash plus a `find ... -exec chmod`
