@@ -1006,3 +1006,58 @@ export async function getPodByName(name): Promise<k8s.V1Pod> {
     namespace: namespace()
   })
 }
+
+// Resolve the PV currently bound to a PVC by reading the PVC's volumeName.
+// Must be called while the PVC still exists (i.e. before the owning pod is
+// deleted and the ephemeral PVC is garbage-collected). Returns undefined if
+// the PVC is missing or not yet bound. This is a namespaced get-by-name, so it
+// works with credentials that cannot list PVs cluster-wide.
+export async function getPvcVolumeName(
+  pvcName: string
+): Promise<string | undefined> {
+  const pvc = await k8sApi.readNamespacedPersistentVolumeClaim({
+    name: pvcName,
+    namespace: namespace()
+  })
+  return pvc.spec?.volumeName
+}
+
+// Release a single, named PV: wait (bounded) for it to reach Released after its
+// PVC is gone, then clear the stale claimRef so it returns to Available for
+// reuse. Targets exactly this PV by name (get/patch by name, no cluster-wide
+// list). Every step is logged so progress shows on the GitHub Actions UI.
+export async function releasePv(
+  pvName: string,
+  maxWaitSeconds = 60
+): Promise<void> {
+  core.info(`[pv-release] Waiting for PV ${pvName} to reach Released...`)
+  let phase: string | undefined
+  const start = Date.now()
+  while (Date.now() - start < maxWaitSeconds * 1000) {
+    const pv = await k8sApi.readPersistentVolume({ name: pvName })
+    phase = pv.status?.phase
+    if (phase === 'Released') {
+      break
+    }
+    if (phase === 'Available') {
+      core.info(`[pv-release] PV ${pvName} is already Available; nothing to do.`)
+      return
+    }
+    core.info(`[pv-release] PV ${pvName} phase=${phase}; waiting...`)
+    await sleep(2000)
+  }
+
+  if (phase !== 'Released') {
+    core.warning(
+      `[pv-release] PV ${pvName} did not reach Released within ${maxWaitSeconds}s (phase=${phase}); leaving it for the reaper.`
+    )
+    return
+  }
+
+  core.info(`[pv-release] PV ${pvName} is Released; clearing claimRef...`)
+  await k8sApi.patchPersistentVolume(
+    { name: pvName, body: { spec: { claimRef: null } } },
+    k8s.setHeaderOptions('Content-Type', k8s.PatchStrategy.MergePatch)
+  )
+  core.info(`[pv-release] PV ${pvName} released; now Available for reuse.`)
+}

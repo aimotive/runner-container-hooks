@@ -27,6 +27,19 @@ export const DEFAULT_WORK_VOLUME_ACCESS_MODE = 'ReadWriteOnce'
 
 export const ENV_SKIP_CP_HASH_VERIFY = 'ACTIONS_RUNNER_SKIP_CP_HASH_VERIFY'
 
+export const ENV_RELEASE_WORK_VOLUME_PV = 'ACTIONS_RUNNER_RELEASE_WORK_VOLUME_PV'
+
+// When true, the cleanup-job hook releases the specific PV that backed this
+// job's work volume: it reads the bound PV name from the work-volume PVC,
+// deletes the pod (which garbage-collects the ephemeral PVC), waits for the PV
+// to reach Released, and clears its claimRef so it returns to Available. This
+// is a targeted, per-job release (no cluster-wide PV sweep) that — unlike a
+// workflow-pod sidecar — runs from the runner side and so survives job
+// cancellation. A low-frequency reaper still backstops hard-kill cases.
+export function releaseWorkVolumePvEnabled(): boolean {
+  return process.env[ENV_RELEASE_WORK_VOLUME_PV] === 'true'
+}
+
 // When the work volume is a large, reused persistent volume, the per-copy
 // integrity safeguards in execCpToPod/execCpFromPod walk the entire /__w tree
 // file-by-file (a `find ... -exec stat` hash plus a `find ... -exec chmod`
