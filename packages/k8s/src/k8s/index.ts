@@ -514,6 +514,30 @@ export async function execCpFromPod(
       const errStream = new WritableStreamBuffer()
 
       await new Promise((resolve, reject) => {
+        // Resolve only once BOTH the exec has reported completion AND the local
+        // tar extraction has fully flushed to disk. The Exec status callback
+        // can fire before tar-fs finishes writing files (the client ends the
+        // stream on close, which then drives 'finish'). Returning on the status
+        // callback alone races the reader — e.g. the runner parsing
+        // _runner_file_commands for step outputs, which produced empty outputs.
+        // Awaiting the writer also makes skipping the hash verify safe.
+        let execDone = false
+        let writerDone = false
+        const tryResolve = (): void => {
+          if (execDone && writerDone) {
+            resolve(undefined)
+          }
+        }
+        writerStream.on('finish', () => {
+          writerDone = true
+          tryResolve()
+        })
+        writerStream.on('close', () => {
+          writerDone = true
+          tryResolve()
+        })
+        writerStream.on('error', reject)
+
         exec
           .exec(
             namespace(),
@@ -531,8 +555,10 @@ export async function execCpFromPod(
                     `Error from cpFromPod - details: \n ${errStream.getContentsAsString()}`
                   )
                 )
+                return
               }
-              resolve(status)
+              execDone = true
+              tryResolve()
             }
           )
           .catch(e => reject(e))
