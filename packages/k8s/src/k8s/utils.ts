@@ -17,6 +17,47 @@ export const EXTERNALS_VOLUME_NAME = 'externals'
 export const GITHUB_VOLUME_NAME = 'github'
 export const WORK_VOLUME = 'work'
 
+export const ENV_WORK_VOLUME_STORAGE_CLASS =
+  'ACTIONS_RUNNER_WORK_VOLUME_STORAGE_CLASS'
+export const ENV_WORK_VOLUME_SIZE = 'ACTIONS_RUNNER_WORK_VOLUME_SIZE'
+export const ENV_WORK_VOLUME_ACCESS_MODE =
+  'ACTIONS_RUNNER_WORK_VOLUME_ACCESS_MODE'
+export const DEFAULT_WORK_VOLUME_SIZE = '50Gi'
+export const DEFAULT_WORK_VOLUME_ACCESS_MODE = 'ReadWriteOnce'
+
+// Build the `work` volume that the job container mounts at /__w (see
+// CONTAINER_VOLUMES). By default this is an emptyDir scoped to the pod's
+// lifetime. When ACTIONS_RUNNER_WORK_VOLUME_STORAGE_CLASS is set, the volume
+// instead becomes a generic ephemeral volume whose PVC is auto-created from
+// that storage class. Backed by a statically-provisioned, Retain-policy local
+// PV pool, this lets the workspace (e.g. the git clone produced by
+// actions/checkout) persist on local disk and be reused across jobs.
+export function buildWorkVolume(): k8s.V1Volume {
+  const storageClass = process.env[ENV_WORK_VOLUME_STORAGE_CLASS]
+  if (!storageClass) {
+    return { name: WORK_VOLUME, emptyDir: {} }
+  }
+  const storage = process.env[ENV_WORK_VOLUME_SIZE] || DEFAULT_WORK_VOLUME_SIZE
+  const accessMode =
+    process.env[ENV_WORK_VOLUME_ACCESS_MODE] || DEFAULT_WORK_VOLUME_ACCESS_MODE
+  return {
+    name: WORK_VOLUME,
+    ephemeral: {
+      volumeClaimTemplate: {
+        spec: {
+          accessModes: [accessMode],
+          storageClassName: storageClass,
+          resources: {
+            requests: {
+              storage
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 export const CONTAINER_VOLUMES: k8s.V1VolumeMount[] = [
   {
     name: EXTERNALS_VOLUME_NAME,

@@ -20,6 +20,7 @@ import {
   fixArgs,
   listDirAllCommand,
   sleep,
+  buildWorkVolume,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -155,10 +156,7 @@ export async function createJobPod(
       name: GITHUB_VOLUME_NAME,
       emptyDir: {}
     },
-    {
-      name: WORK_VOLUME,
-      emptyDir: {}
-    }
+    buildWorkVolume()
   ]
 
   if (registry) {
@@ -218,10 +216,7 @@ export async function createContainerStepPod(
       name: GITHUB_VOLUME_NAME,
       emptyDir: {}
     },
-    {
-      name: WORK_VOLUME,
-      emptyDir: {}
-    }
+    buildWorkVolume()
   ]
 
   if (extension?.metadata) {
