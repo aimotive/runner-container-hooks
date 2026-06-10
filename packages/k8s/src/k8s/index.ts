@@ -20,6 +20,7 @@ import {
   listDirAllCommand,
   sleep,
   buildWorkVolume,
+  skipCpHashVerify,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -378,7 +379,11 @@ export async function execCpToPod(
   runnerPath: string,
   containerPath: string
 ): Promise<void> {
-  core.debug(`Copying ${runnerPath} to pod ${podName} at ${containerPath}`)
+  const skipVerify = skipCpHashVerify()
+  core.info(
+    `Copying ${runnerPath} into pod ${podName}:${containerPath}` +
+      (skipVerify ? ' (hash verify + chmod fixup disabled)' : '')
+  )
 
   let attempt = 0
   while (true) {
@@ -386,13 +391,24 @@ export async function execCpToPod(
       const exec = new k8s.Exec(kc)
       // Use tar to extract with --no-same-owner to avoid ownership issues.
       // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
-      const command = [
-        'sh',
-        '-c',
-        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
-      ]
+      //
+      // The two `find ... -exec chmod` passes walk the WHOLE target tree
+      // file-by-file. On a large reused persistent /__w that is prohibitively
+      // slow (one fork per file), so when verification is disabled we extract
+      // the incoming delta only and skip the whole-tree permission fixup.
+      const command = skipVerify
+        ? [
+            'sh',
+            '-c',
+            `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null`
+          ]
+        : [
+            'sh',
+            '-c',
+            `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+              `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+              `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
+          ]
       const readStream = tar.pack(runnerPath)
       const errStream = new WritableStreamBuffer()
       await new Promise((resolve, reject) => {
@@ -430,6 +446,11 @@ export async function execCpToPod(
       }
       await sleep(1000)
     }
+  }
+
+  if (skipVerify) {
+    core.info(`Copied ${runnerPath} into ${podName}:${containerPath}`)
+    return
   }
 
   let attempts = 15
@@ -527,6 +548,10 @@ export async function execCpFromPod(
       }
       await sleep(1000)
     }
+  }
+
+  if (skipCpHashVerify()) {
+    return
   }
 
   let attempts = 15
@@ -676,10 +701,12 @@ export async function waitForPodPhases(
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
   let phase: PodPhase = PodPhase.UNKNOWN
+  let lastProgress = ''
   try {
     while (true) {
       phase = await getPodPhase(podName)
       if (awaitingPhases.has(phase)) {
+        core.info(`Pod ${podName} reached phase ${phase}`)
         return
       }
 
@@ -688,12 +715,65 @@ export async function waitForPodPhases(
           `Pod ${podName} is unhealthy with phase status ${phase}`
         )
       }
+      lastProgress = await logPodProgress(podName, phase, lastProgress)
       await backOffManager.backOff()
     }
   } catch (error) {
     throw new Error(
       `Pod ${podName} is unhealthy with phase status ${phase}: ${JSON.stringify(error)}`
     )
+  }
+}
+
+// Emit a concise, human-readable line about what each (init)container is doing
+// while the pod is not yet ready — image being pulled, waiting reason/message
+// (ContainerCreating, ImagePullBackOff, ...), or running/terminated state.
+// Surfaces image-pull progress and stalls on the GitHub Actions UI. Only logs
+// when the message changes from the previous poll to avoid spamming.
+async function logPodProgress(
+  podName: string,
+  phase: PodPhase,
+  last: string
+): Promise<string> {
+  try {
+    const pod = await k8sApi.readNamespacedPod({
+      name: podName,
+      namespace: namespace()
+    })
+    const lines: string[] = []
+    const describe = (
+      statuses: k8s.V1ContainerStatus[] | undefined,
+      kind: string
+    ): void => {
+      for (const cs of statuses || []) {
+        const state = cs.state || {}
+        if (state.waiting) {
+          const reason = state.waiting.reason || 'Waiting'
+          const detail = state.waiting.message ? ` - ${state.waiting.message}` : ''
+          lines.push(`${kind} ${cs.name} [${cs.image}]: ${reason}${detail}`)
+        } else if (state.running) {
+          lines.push(`${kind} ${cs.name} [${cs.image}]: Running`)
+        } else if (state.terminated) {
+          lines.push(
+            `${kind} ${cs.name} [${cs.image}]: Terminated (${state.terminated.reason})`
+          )
+        }
+      }
+    }
+    describe(pod.status?.initContainerStatuses, 'init')
+    describe(pod.status?.containerStatuses, 'container')
+
+    const msg =
+      `Waiting for pod ${podName} (phase ${phase})` +
+      (lines.length ? `\n  ${lines.join('\n  ')}` : '')
+    if (msg !== last) {
+      core.info(msg)
+      return msg
+    }
+    return last
+  } catch {
+    // Status read is best-effort; never let logging break the wait loop.
+    return last
   }
 }
 

@@ -25,6 +25,19 @@ export const ENV_WORK_VOLUME_ACCESS_MODE =
 export const DEFAULT_WORK_VOLUME_SIZE = '50Gi'
 export const DEFAULT_WORK_VOLUME_ACCESS_MODE = 'ReadWriteOnce'
 
+export const ENV_SKIP_CP_HASH_VERIFY = 'ACTIONS_RUNNER_SKIP_CP_HASH_VERIFY'
+
+// When the work volume is a large, reused persistent volume, the per-copy
+// integrity safeguards in execCpToPod/execCpFromPod walk the entire /__w tree
+// file-by-file (a `find ... -exec stat` hash plus a `find ... -exec chmod`
+// permission fixup). On a huge retained clone these forks-per-file never
+// realistically finish, hanging "Initialize containers". Setting
+// ACTIONS_RUNNER_SKIP_CP_HASH_VERIFY=true skips both whole-tree passes: the
+// copy just extracts the (small) incoming delta and returns without verifying.
+export function skipCpHashVerify(): boolean {
+  return process.env[ENV_SKIP_CP_HASH_VERIFY] === 'true'
+}
+
 // Build the `work` volume that the job container mounts at /__w (see
 // CONTAINER_VOLUMES). By default this is an emptyDir scoped to the pod's
 // lifetime. When ACTIONS_RUNNER_WORK_VOLUME_STORAGE_CLASS is set, the volume
