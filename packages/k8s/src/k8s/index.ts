@@ -24,6 +24,7 @@ import {
   buildWorkVolume,
   skipCpHashVerify,
   formatResourceUsageReport,
+  getNodePinFromPrLabel,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -180,6 +181,19 @@ export async function createJobPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
+  // Debug override: pin the workflow pod to a node named by a PR label. Applied
+  // after the extension merge so it wins over the podTemplate's scheduling.
+  const pinnedNode = getNodePinFromPrLabel()
+  if (pinnedNode) {
+    appPod.spec.nodeSelector = {
+      ...(appPod.spec.nodeSelector ?? {}),
+      'kubernetes.io/hostname': pinnedNode
+    }
+    core.info(
+      `[node-pin] pinning workflow pod to node ${pinnedNode} (from PR label)`
+    )
+  }
+
   return await k8sApi.createNamespacedPod({
     namespace: namespace(),
     body: appPod
@@ -228,6 +242,19 @@ export async function createContainerStepPod(
 
   if (extension?.spec) {
     mergePodSpecWithOptions(appPod.spec, extension.spec)
+  }
+
+  // Debug override: pin the workflow pod to a node named by a PR label. Applied
+  // after the extension merge so it wins over the podTemplate's scheduling.
+  const pinnedNode = getNodePinFromPrLabel()
+  if (pinnedNode) {
+    appPod.spec.nodeSelector = {
+      ...(appPod.spec.nodeSelector ?? {}),
+      'kubernetes.io/hostname': pinnedNode
+    }
+    core.info(
+      `[node-pin] pinning workflow pod to node ${pinnedNode} (from PR label)`
+    )
   }
 
   return await k8sApi.createNamespacedPod({

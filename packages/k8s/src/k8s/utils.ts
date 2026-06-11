@@ -170,6 +170,100 @@ export function buildWorkVolume(): k8s.V1Volume {
   }
 }
 
+export const ENV_NODE_PIN_FROM_PR_LABEL =
+  'ACTIONS_RUNNER_NODE_PIN_FROM_PR_LABEL'
+export const ENV_NODE_PIN_LABEL_PREFIX =
+  'ACTIONS_RUNNER_NODE_PIN_LABEL_PREFIX'
+export const DEFAULT_NODE_PIN_LABEL_PREFIX = 'ci:node:'
+
+// Debug helper: when enabled, redirect the workflow pod to a specific node
+// named by a pull-request label `ci:node:<nodename>` (prefix configurable).
+// Returns the node name, or undefined when disabled, not a PR event, no
+// matching label, or anything fails to parse (never breaks job prep).
+// Applied as a `kubernetes.io/hostname` nodeSelector, so the scheduler still
+// honours taints/resources (the pod stays Pending if the node can't take it).
+export function getNodePinFromPrLabel(): string | undefined {
+  if (process.env[ENV_NODE_PIN_FROM_PR_LABEL] !== 'true') {
+    return undefined
+  }
+  const eventName = process.env['GITHUB_EVENT_NAME']
+  if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
+    return undefined
+  }
+  const eventPath = process.env['GITHUB_EVENT_PATH']
+  if (!eventPath) {
+    return undefined
+  }
+  const prefix =
+    process.env[ENV_NODE_PIN_LABEL_PREFIX] || DEFAULT_NODE_PIN_LABEL_PREFIX
+
+  try {
+    const payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
+    const labels = payload?.pull_request?.labels
+    if (!Array.isArray(labels)) {
+      return undefined
+    }
+    const matches = labels
+      .map((l: { name?: string }) => l?.name)
+      .filter((n: unknown): n is string => typeof n === 'string')
+      .filter(n => n.startsWith(prefix))
+    if (!matches.length) {
+      return undefined
+    }
+    if (matches.length > 1) {
+      core.warning(
+        `[node-pin] multiple '${prefix}' labels found (${matches.join(', ')}); using the first`
+      )
+    }
+    const node = matches[0].slice(prefix.length).trim()
+    return node || undefined
+  } catch (err) {
+    core.debug(
+      `[node-pin] could not read PR labels from ${eventPath}: ${(err as Error)?.message ?? err}`
+    )
+    return undefined
+  }
+}
+
+export const ENV_ALLOW_JOB_RESOURCES = 'ACTIONS_RUNNER_ALLOW_JOB_RESOURCES'
+// Workflow-facing env key (set in the workflow's `container.env`), NOT a
+// RunnerSet env var. Holds a JSON V1ResourceRequirements object.
+export const JOB_RESOURCES_ENV_KEY = 'K8S_JOB_RESOURCES'
+
+// Let a workflow override the job container's resources from its own YAML
+// (e.g. per matrix axis) via a JSON env var, without one RunnerSet per axis.
+// `container.resources` is not valid GitHub Actions syntax and never reaches
+// the hook, so the value is carried as an env var in `container.env`. Gated by
+// the RunnerSet flag ACTIONS_RUNNER_ALLOW_JOB_RESOURCES so the admin controls
+// whether workflows may set their own resources. Returns undefined (→ fall back
+// to the podTemplate resources) when disabled, unset, or unparseable.
+export function parseJobResourcesFromEnv(envVars?: {
+  [key: string]: string
+}): k8s.V1ResourceRequirements | undefined {
+  if (process.env[ENV_ALLOW_JOB_RESOURCES] !== 'true') {
+    return undefined
+  }
+  const raw = envVars?.[JOB_RESOURCES_ENV_KEY]
+  if (!raw) {
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('not an object')
+    }
+    if (parsed.requests === undefined && parsed.limits === undefined) {
+      throw new Error('expected "requests" and/or "limits"')
+    }
+    return parsed as k8s.V1ResourceRequirements
+  } catch (err) {
+    core.warning(
+      `[resources] ignoring invalid ${JOB_RESOURCES_ENV_KEY}: ${(err as Error)?.message ?? err}`
+    )
+    return undefined
+  }
+}
+
 export const CONTAINER_VOLUMES: k8s.V1VolumeMount[] = [
   {
     name: EXTERNALS_VOLUME_NAME,
