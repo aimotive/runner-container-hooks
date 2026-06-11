@@ -24,6 +24,7 @@ import {
   formatResourceMap,
   generateContainerName,
   mergeContainerWithOptions,
+  parseJobResourcesFromEnv,
   readExtensionFromFile,
   PodPhase,
   fixArgs,
@@ -284,16 +285,21 @@ export function createContainerSpec(
 
   podContainer.volumeMounts = CONTAINER_VOLUMES
 
-  if (!extension) {
-    return podContainer
+  if (extension) {
+    const from = extension.spec?.containers?.find(
+      c => c.name === CONTAINER_EXTENSION_PREFIX + name
+    )
+    if (from) {
+      mergeContainerWithOptions(podContainer, from)
+    }
   }
 
-  const from = extension.spec?.containers?.find(
-    c => c.name === CONTAINER_EXTENSION_PREFIX + name
-  )
-
-  if (from) {
-    mergeContainerWithOptions(podContainer, from)
+  // Optional per-job resource override driven from the workflow (gated by
+  // ACTIONS_RUNNER_ALLOW_JOB_RESOURCES). Applied last so it wins over the
+  // podTemplate $job resources; no-op when disabled/unset.
+  const jobResources = parseJobResourcesFromEnv(container['environmentVariables'])
+  if (jobResources) {
+    podContainer.resources = jobResources
   }
 
   return podContainer
