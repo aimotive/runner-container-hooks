@@ -7,7 +7,7 @@
 # Usage:
 #   ./build-novolume-runner.sh             # build + load into local docker
 #   PUSH=true ./build-novolume-runner.sh   # build + push to the registry
-#   TAG=v2.335.1-hooks5 ./build-novolume-runner.sh   # override the tag
+#   TAG=v2.335.1-hooks6 ./build-novolume-runner.sh   # override the tag
 #
 # Env overrides: REGISTRY, IMAGE, TAG, PLATFORM, PUSH, BASE_IMAGE
 set -euo pipefail
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REGISTRY="${REGISTRY:-registry.example.com}"
 IMAGE="${IMAGE:-actions-runner}"
-TAG="${TAG:-v2.335.1-hooks5}"
+TAG="${TAG:-v2.335.1-hooks6}"
 PLATFORM="${PLATFORM:-linux/amd64}"
 PUSH="${PUSH:-false}"
 # Base runner image: official upstream by default; override to use a mirror.

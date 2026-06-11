@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import * as fs from 'fs'
 import * as path from 'path'
 import { spawn } from 'child_process'
 import * as k8s from '@kubernetes/client-node'
@@ -496,6 +497,35 @@ export async function execCpFromPod(
     `Copying from pod ${podName} ${containerPath} to ${targetRunnerPath}`
   )
 
+  // Files in the pod are written by the root job container, so tar entries are
+  // owned by uid 0. When the hook runs as root, tar-fs would chown the
+  // extracted files back to root on the runner's filesystem, leaving
+  // /home/runner/_work full of root-owned files the non-root runner cannot
+  // touch (e.g. "Prepare workflow directory" failing with access denied). Map
+  // every entry to the runner workspace owner and guarantee the owner can
+  // read/write/traverse, so the runner always retains control of its _work.
+  let ownerUid = process.getuid?.()
+  let ownerGid = process.getgid?.()
+  try {
+    const st = fs.statSync(parentRunnerPath)
+    ownerUid = st.uid
+    ownerGid = st.gid
+  } catch {
+    // Fall back to the current process owner if the target dir isn't there yet.
+  }
+  const remapOwnership = (header: {
+    uid?: number
+    gid?: number
+    mode?: number
+    type?: string
+  }): typeof header => {
+    if (ownerUid !== undefined) header.uid = ownerUid
+    if (ownerGid !== undefined) header.gid = ownerGid
+    header.mode =
+      (header.mode ?? 0) | (header.type === 'directory' ? 0o700 : 0o600)
+    return header
+  }
+
   let attempt = 0
   while (true) {
     try {
@@ -511,7 +541,9 @@ export async function execCpFromPod(
         containerPaths.join('/') || '/',
         dirname
       ]
-      const writerStream = tar.extract(parentRunnerPath)
+      const writerStream = tar.extract(parentRunnerPath, {
+        map: remapOwnership
+      })
       const errStream = new WritableStreamBuffer()
 
       await new Promise((resolve, reject) => {
