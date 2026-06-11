@@ -176,6 +176,35 @@ export const ENV_NODE_PIN_LABEL_PREFIX =
   'ACTIONS_RUNNER_NODE_PIN_LABEL_PREFIX'
 export const DEFAULT_NODE_PIN_LABEL_PREFIX = 'ci:node:'
 
+// Locate the PR event payload on the runner. GITHUB_EVENT_PATH is not reliably
+// exported to the container hook (it comes through unset even when
+// GITHUB_EVENT_NAME is set), so fall back to the runner's well-known location
+// under RUNNER_TEMP (which the hook does receive): $RUNNER_TEMP/_github_workflow/
+// event.json, scanning the dir for any *.json if the default name differs.
+function resolvePrEventPath(): string | undefined {
+  const fromEnv = process.env['GITHUB_EVENT_PATH']
+  if (fromEnv && fs.existsSync(fromEnv)) {
+    return fromEnv
+  }
+  const runnerTemp = process.env['RUNNER_TEMP']
+  if (runnerTemp) {
+    const dir = `${runnerTemp}/_github_workflow`
+    const candidate = `${dir}/event.json`
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+    try {
+      const json = fs.readdirSync(dir).find(n => n.endsWith('.json'))
+      if (json) {
+        return `${dir}/${json}`
+      }
+    } catch {
+      // directory missing — nothing to resolve
+    }
+  }
+  return undefined
+}
+
 // Debug helper: when enabled, redirect the workflow pod to a specific node
 // named by a pull-request label `ci:node:<nodename>` (prefix configurable).
 // Returns the node name, or undefined when disabled, not a PR event, no
@@ -187,19 +216,24 @@ export function getNodePinFromPrLabel(): string | undefined {
     return undefined
   }
   const eventName = process.env['GITHUB_EVENT_NAME']
-  const eventPath = process.env['GITHUB_EVENT_PATH']
   const prefix =
     process.env[ENV_NODE_PIN_LABEL_PREFIX] || DEFAULT_NODE_PIN_LABEL_PREFIX
-  core.info(
-    `[node-pin] enabled; event='${eventName ?? '(unset)'}' eventPath='${eventPath ?? '(unset)'}' prefix='${prefix}'`
-  )
 
   if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
-    core.info(`[node-pin] not a pull_request event; skipping`)
+    core.info(
+      `[node-pin] event='${eventName ?? '(unset)'}' is not a pull_request; skipping`
+    )
     return undefined
   }
+
+  const eventPath = resolvePrEventPath()
+  core.info(
+    `[node-pin] enabled; event='${eventName}' eventPath='${eventPath ?? '(not found)'}' prefix='${prefix}'`
+  )
   if (!eventPath) {
-    core.info(`[node-pin] GITHUB_EVENT_PATH is unset; cannot read PR labels`)
+    core.info(
+      `[node-pin] could not locate the PR event payload (GITHUB_EVENT_PATH unset, RUNNER_TEMP='${process.env['RUNNER_TEMP'] ?? '(unset)'}')`
+    )
     return undefined
   }
 
