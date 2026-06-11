@@ -24,6 +24,7 @@ import {
   skipCpHashVerify,
   formatResourceUsageReport,
   getNodePinFromPrLabel,
+  getNodePinFromEnvList,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -178,9 +179,14 @@ export async function createJobPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  // Debug override: pin the workflow pod to a node named by a PR label. Applied
-  // after the extension merge so it wins over the podTemplate's scheduling.
-  const pinnedNode = getNodePinFromPrLabel()
+  // Debug override: pin the workflow pod to a node named by a PR label. Primary
+  // source is the K8S_JOB_NODE container env (resolved from the label by the
+  // workflow, where the event payload is available — the hook process gets
+  // neither GITHUB_EVENT_PATH nor the event file at prepare time). The
+  // event-file lookup remains as fallback. Applied after the extension merge so
+  // it wins over the podTemplate's scheduling.
+  const pinnedNode =
+    getNodePinFromEnvList(jobContainer?.env) ?? getNodePinFromPrLabel()
   if (pinnedNode) {
     appPod.spec.nodeSelector = {
       ...(appPod.spec.nodeSelector ?? {}),
@@ -241,9 +247,10 @@ export async function createContainerStepPod(
     mergePodSpecWithOptions(appPod.spec, extension.spec)
   }
 
-  // Debug override: pin the workflow pod to a node named by a PR label. Applied
-  // after the extension merge so it wins over the podTemplate's scheduling.
-  const pinnedNode = getNodePinFromPrLabel()
+  // Debug override: pin the step pod to a node named by a PR label (see
+  // createJobPod). Env-first, event-file fallback; applied after the merge.
+  const pinnedNode =
+    getNodePinFromEnvList(container.env) ?? getNodePinFromPrLabel()
   if (pinnedNode) {
     appPod.spec.nodeSelector = {
       ...(appPod.spec.nodeSelector ?? {}),
