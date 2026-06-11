@@ -187,27 +187,37 @@ export function getNodePinFromPrLabel(): string | undefined {
     return undefined
   }
   const eventName = process.env['GITHUB_EVENT_NAME']
-  if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
-    return undefined
-  }
   const eventPath = process.env['GITHUB_EVENT_PATH']
-  if (!eventPath) {
-    return undefined
-  }
   const prefix =
     process.env[ENV_NODE_PIN_LABEL_PREFIX] || DEFAULT_NODE_PIN_LABEL_PREFIX
+  core.info(
+    `[node-pin] enabled; event='${eventName ?? '(unset)'}' eventPath='${eventPath ?? '(unset)'}' prefix='${prefix}'`
+  )
+
+  if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
+    core.info(`[node-pin] not a pull_request event; skipping`)
+    return undefined
+  }
+  if (!eventPath) {
+    core.info(`[node-pin] GITHUB_EVENT_PATH is unset; cannot read PR labels`)
+    return undefined
+  }
 
   try {
     const payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
     const labels = payload?.pull_request?.labels
     if (!Array.isArray(labels)) {
+      core.info(`[node-pin] no pull_request.labels array in event payload`)
       return undefined
     }
-    const matches = labels
+    const names = labels
       .map((l: { name?: string }) => l?.name)
       .filter((n: unknown): n is string => typeof n === 'string')
-      .filter(n => n.startsWith(prefix))
+    core.info(`[node-pin] PR labels: ${names.join(', ') || '(none)'}`)
+
+    const matches = names.filter(n => n.startsWith(prefix))
     if (!matches.length) {
+      core.info(`[node-pin] no label with prefix '${prefix}'`)
       return undefined
     }
     if (matches.length > 1) {
@@ -216,9 +226,13 @@ export function getNodePinFromPrLabel(): string | undefined {
       )
     }
     const node = matches[0].slice(prefix.length).trim()
-    return node || undefined
+    if (!node) {
+      core.info(`[node-pin] label '${matches[0]}' has an empty node name`)
+      return undefined
+    }
+    return node
   } catch (err) {
-    core.debug(
+    core.warning(
       `[node-pin] could not read PR labels from ${eventPath}: ${(err as Error)?.message ?? err}`
     )
     return undefined
@@ -245,6 +259,9 @@ export function parseJobResourcesFromEnv(envVars?: {
   }
   const raw = envVars?.[JOB_RESOURCES_ENV_KEY]
   if (!raw) {
+    core.info(
+      `[resources] ALLOW_JOB_RESOURCES enabled but ${JOB_RESOURCES_ENV_KEY} not present in the container env (${Object.keys(envVars ?? {}).length} env var(s) received); using podTemplate resources`
+    )
     return undefined
   }
   try {
@@ -255,6 +272,7 @@ export function parseJobResourcesFromEnv(envVars?: {
     if (parsed.requests === undefined && parsed.limits === undefined) {
       throw new Error('expected "requests" and/or "limits"')
     }
+    core.info(`[resources] applying workflow-provided ${JOB_RESOURCES_ENV_KEY}`)
     return parsed as k8s.V1ResourceRequirements
   } catch (err) {
     core.warning(
