@@ -175,6 +175,24 @@ export const ENV_NODE_PIN_FROM_PR_LABEL =
 export const ENV_NODE_PIN_LABEL_PREFIX =
   'ACTIONS_RUNNER_NODE_PIN_LABEL_PREFIX'
 export const DEFAULT_NODE_PIN_LABEL_PREFIX = 'ci:node:'
+// Workflow-facing env key (set in the workflow's `container.env`, like
+// K8S_JOB_RESOURCES). Carries the node name resolved from the PR label by the
+// workflow itself, where the event payload is always available — the hook
+// process gets neither GITHUB_EVENT_PATH nor the event file at prepare time.
+export const NODE_PIN_ENV_KEY = 'K8S_JOB_NODE'
+
+// Primary node-pin source: the K8S_JOB_NODE container env var, resolved by the
+// workflow from the `ci:node:<nodename>` PR label. Gated by the same RunnerSet
+// flag as the event-file fallback.
+export function getNodePinFromEnvList(
+  env?: k8s.V1EnvVar[]
+): string | undefined {
+  if (process.env[ENV_NODE_PIN_FROM_PR_LABEL] !== 'true') {
+    return undefined
+  }
+  const node = env?.find(e => e.name === NODE_PIN_ENV_KEY)?.value?.trim()
+  return node || undefined
+}
 
 // Locate the PR event payload on the runner. GITHUB_EVENT_PATH is not reliably
 // exported to the container hook (it comes through unset even when
