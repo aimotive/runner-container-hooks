@@ -47,6 +47,10 @@ export async function runScriptStep(
     'mkdir -p /__w/_temp /__w/_temp_pre',
     'SRC=/__w/_temp_pre',
     'DST=/__w/_temp',
+    // _runner_file_commands may not exist yet (e.g. first step of a job, or
+    // an empty directory dropped by the tar-based pod copy), so create both
+    // sides before merging instead of assuming the source is present.
+    'mkdir -p "$SRC/_runner_file_commands" "$DST/_runner_file_commands"',
     // Overwrite _runner_file_commands
     'cp -a "$SRC/_runner_file_commands/." "$DST/_runner_file_commands"',
     `find "$SRC" -type f ! -path "*/_runner_file_commands/*" -exec sh -c '
