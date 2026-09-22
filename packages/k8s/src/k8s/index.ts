@@ -1,4 +1,5 @@
 import * as core from '@actions/core'
+import * as fs from 'fs'
 import * as path from 'path'
 import { spawn } from 'child_process'
 import * as k8s from '@kubernetes/client-node'
@@ -20,6 +21,11 @@ import {
   fixArgs,
   listDirAllCommand,
   sleep,
+  buildWorkVolume,
+  skipCpHashVerify,
+  formatResourceUsageReport,
+  getNodePinFromPrLabel,
+  getNodePinFromEnvList,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -155,10 +161,7 @@ export async function createJobPod(
       name: GITHUB_VOLUME_NAME,
       emptyDir: {}
     },
-    {
-      name: WORK_VOLUME,
-      emptyDir: {}
-    }
+    buildWorkVolume()
   ]
 
   if (registry) {
@@ -177,6 +180,24 @@ export async function createJobPod(
 
   if (extension?.spec) {
     mergePodSpecWithOptions(appPod.spec, extension.spec)
+  }
+
+  // Debug override: pin the workflow pod to a node named by a PR label. Primary
+  // source is the K8S_JOB_NODE container env (resolved from the label by the
+  // workflow, where the event payload is available — the hook process gets
+  // neither GITHUB_EVENT_PATH nor the event file at prepare time). The
+  // event-file lookup remains as fallback. Applied after the extension merge so
+  // it wins over the podTemplate's scheduling.
+  const pinnedNode =
+    getNodePinFromEnvList(jobContainer?.env) ?? getNodePinFromPrLabel()
+  if (pinnedNode) {
+    appPod.spec.nodeSelector = {
+      ...(appPod.spec.nodeSelector ?? {}),
+      'kubernetes.io/hostname': pinnedNode
+    }
+    core.info(
+      `[node-pin] pinning workflow pod to node ${pinnedNode} (from PR label)`
+    )
   }
 
   return await k8sApi.createNamespacedPod({
@@ -218,10 +239,7 @@ export async function createContainerStepPod(
       name: GITHUB_VOLUME_NAME,
       emptyDir: {}
     },
-    {
-      name: WORK_VOLUME,
-      emptyDir: {}
-    }
+    buildWorkVolume()
   ]
 
   if (extension?.metadata) {
@@ -230,6 +248,20 @@ export async function createContainerStepPod(
 
   if (extension?.spec) {
     mergePodSpecWithOptions(appPod.spec, extension.spec)
+  }
+
+  // Debug override: pin the step pod to a node named by a PR label (see
+  // createJobPod). Env-first, event-file fallback; applied after the merge.
+  const pinnedNode =
+    getNodePinFromEnvList(container.env) ?? getNodePinFromPrLabel()
+  if (pinnedNode) {
+    appPod.spec.nodeSelector = {
+      ...(appPod.spec.nodeSelector ?? {}),
+      'kubernetes.io/hostname': pinnedNode
+    }
+    core.info(
+      `[node-pin] pinning workflow pod to node ${pinnedNode} (from PR label)`
+    )
   }
 
   return await k8sApi.createNamespacedPod({
@@ -471,7 +503,11 @@ export async function execCpToPod(
   runnerPath: string,
   containerPath: string
 ): Promise<void> {
-  core.debug(`Copying ${runnerPath} to pod ${podName} at ${containerPath}`)
+  const skipVerify = skipCpHashVerify()
+  core.info(
+    `Copying ${runnerPath} into pod ${podName}:${containerPath}` +
+      (skipVerify ? ' (hash verify + chmod fixup disabled)' : '')
+  )
 
   let attempt = 0
   while (true) {
@@ -479,13 +515,24 @@ export async function execCpToPod(
       const exec = new k8s.Exec(kc)
       // Use tar to extract with --no-same-owner to avoid ownership issues.
       // Then use find to fix permissions. The -m flag helps but we also need to fix permissions after.
-      const command = [
-        'sh',
-        '-c',
-        `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
-          `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
-      ]
+      //
+      // The two `find ... -exec chmod` passes walk the WHOLE target tree
+      // file-by-file. On a large reused persistent /__w that is prohibitively
+      // slow (one fork per file), so when verification is disabled we extract
+      // the incoming delta only and skip the whole-tree permission fixup.
+      const command = skipVerify
+        ? [
+            'sh',
+            '-c',
+            `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null`
+          ]
+        : [
+            'sh',
+            '-c',
+            `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+              `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
+              `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
+          ]
       const readStream = tar.pack(runnerPath)
       const errStream = new WritableStreamBuffer()
       await new Promise((resolve, reject) => {
@@ -523,6 +570,11 @@ export async function execCpToPod(
       }
       await sleep(1000)
     }
+  }
+
+  if (skipVerify) {
+    core.info(`Copied ${runnerPath} into ${podName}:${containerPath}`)
+    return
   }
 
   let attempts = 15
@@ -567,6 +619,35 @@ export async function execCpFromPod(
     `Copying from pod ${podName} ${containerPath} to ${targetRunnerPath}`
   )
 
+  // Files in the pod are written by the root job container, so tar entries are
+  // owned by uid 0. When the hook runs as root, tar-fs would chown the
+  // extracted files back to root on the runner's filesystem, leaving
+  // /home/runner/_work full of root-owned files the non-root runner cannot
+  // touch (e.g. "Prepare workflow directory" failing with access denied). Map
+  // every entry to the runner workspace owner and guarantee the owner can
+  // read/write/traverse, so the runner always retains control of its _work.
+  let ownerUid = process.getuid?.()
+  let ownerGid = process.getgid?.()
+  try {
+    const st = fs.statSync(parentRunnerPath)
+    ownerUid = st.uid
+    ownerGid = st.gid
+  } catch {
+    // Fall back to the current process owner if the target dir isn't there yet.
+  }
+  const remapOwnership = (header: {
+    uid?: number
+    gid?: number
+    mode?: number
+    type?: string
+  }): typeof header => {
+    if (ownerUid !== undefined) header.uid = ownerUid
+    if (ownerGid !== undefined) header.gid = ownerGid
+    header.mode =
+      (header.mode ?? 0) | (header.type === 'directory' ? 0o700 : 0o600)
+    return header
+  }
+
   let attempt = 0
   while (true) {
     try {
@@ -582,10 +663,36 @@ export async function execCpFromPod(
         containerPaths.join('/') || '/',
         dirname
       ]
-      const writerStream = tar.extract(parentRunnerPath)
+      const writerStream = tar.extract(parentRunnerPath, {
+        map: remapOwnership
+      })
       const errStream = new WritableStreamBuffer()
 
       await new Promise((resolve, reject) => {
+        // Resolve only once BOTH the exec has reported completion AND the local
+        // tar extraction has fully flushed to disk. The Exec status callback
+        // can fire before tar-fs finishes writing files (the client ends the
+        // stream on close, which then drives 'finish'). Returning on the status
+        // callback alone races the reader — e.g. the runner parsing
+        // _runner_file_commands for step outputs, which produced empty outputs.
+        // Awaiting the writer also makes skipping the hash verify safe.
+        let execDone = false
+        let writerDone = false
+        const tryResolve = (): void => {
+          if (execDone && writerDone) {
+            resolve(undefined)
+          }
+        }
+        writerStream.on('finish', () => {
+          writerDone = true
+          tryResolve()
+        })
+        writerStream.on('close', () => {
+          writerDone = true
+          tryResolve()
+        })
+        writerStream.on('error', reject)
+
         exec
           .exec(
             namespace(),
@@ -603,8 +710,10 @@ export async function execCpFromPod(
                     `Error from cpFromPod - details: \n ${errStream.getContentsAsString()}`
                   )
                 )
+                return
               }
-              resolve(status)
+              execDone = true
+              tryResolve()
             }
           )
           .catch(e => reject(e))
@@ -620,6 +729,10 @@ export async function execCpFromPod(
       }
       await sleep(1000)
     }
+  }
+
+  if (skipCpHashVerify()) {
+    return
   }
 
   let attempts = 15
@@ -769,10 +882,12 @@ export async function waitForPodPhases(
 ): Promise<void> {
   const backOffManager = new BackOffManager(maxTimeSeconds)
   let phase: PodPhase = PodPhase.UNKNOWN
+  let lastProgress = ''
   try {
     while (true) {
       phase = await getPodPhase(podName)
       if (awaitingPhases.has(phase)) {
+        core.info(`Pod ${podName} reached phase ${phase}`)
         return
       }
 
@@ -781,12 +896,65 @@ export async function waitForPodPhases(
           `Pod ${podName} is unhealthy with phase status ${phase}`
         )
       }
+      lastProgress = await logPodProgress(podName, phase, lastProgress)
       await backOffManager.backOff()
     }
   } catch (error) {
     throw new Error(
       `Pod ${podName} is unhealthy with phase status ${phase}: ${formatError(error)}`
     )
+  }
+}
+
+// Emit a concise, human-readable line about what each (init)container is doing
+// while the pod is not yet ready — image being pulled, waiting reason/message
+// (ContainerCreating, ImagePullBackOff, ...), or running/terminated state.
+// Surfaces image-pull progress and stalls on the GitHub Actions UI. Only logs
+// when the message changes from the previous poll to avoid spamming.
+async function logPodProgress(
+  podName: string,
+  phase: PodPhase,
+  last: string
+): Promise<string> {
+  try {
+    const pod = await k8sApi.readNamespacedPod({
+      name: podName,
+      namespace: namespace()
+    })
+    const lines: string[] = []
+    const describe = (
+      statuses: k8s.V1ContainerStatus[] | undefined,
+      kind: string
+    ): void => {
+      for (const cs of statuses || []) {
+        const state = cs.state || {}
+        if (state.waiting) {
+          const reason = state.waiting.reason || 'Waiting'
+          const detail = state.waiting.message ? ` - ${state.waiting.message}` : ''
+          lines.push(`${kind} ${cs.name} [${cs.image}]: ${reason}${detail}`)
+        } else if (state.running) {
+          lines.push(`${kind} ${cs.name} [${cs.image}]: Running`)
+        } else if (state.terminated) {
+          lines.push(
+            `${kind} ${cs.name} [${cs.image}]: Terminated (${state.terminated.reason})`
+          )
+        }
+      }
+    }
+    describe(pod.status?.initContainerStatuses, 'init')
+    describe(pod.status?.containerStatuses, 'container')
+
+    const msg =
+      `Waiting for pod ${podName} (phase ${phase})` +
+      (lines.length ? `\n  ${lines.join('\n  ')}` : '')
+    if (msg !== last) {
+      core.info(msg)
+      return msg
+    }
+    return last
+  } catch {
+    // Status read is best-effort; never let logging break the wait loop.
+    return last
   }
 }
 
@@ -1018,4 +1186,133 @@ export async function getPodByName(name): Promise<k8s.V1Pod> {
     name,
     namespace: namespace()
   })
+}
+
+// Exec a command in a pod container and capture its stdout as a string.
+async function execPodCaptureStdout(
+  command: string[],
+  podName: string,
+  containerName: string
+): Promise<string> {
+  const exec = new k8s.Exec(kc)
+  let output = ''
+  const outStream = new stream.Writable({
+    write(chunk, _enc, cb) {
+      output += chunk.toString('utf8')
+      cb()
+    }
+  })
+  await new Promise<void>((resolve, reject) => {
+    exec
+      .exec(
+        namespace(),
+        podName,
+        containerName,
+        command,
+        outStream,
+        process.stderr,
+        null,
+        false,
+        resp => {
+          if (resp.status === 'Success') {
+            resolve()
+          } else {
+            reject(new Error(resp?.message || 'exec failed'))
+          }
+        }
+      )
+      .catch(reject)
+  })
+  outStream.end()
+  return output
+}
+
+// Read the job container's cgroup peak memory (and cumulative CPU) and log it
+// against the configured limit. Must be called while the container is still
+// alive (i.e. before prunePods). Best-effort: any failure is swallowed with a
+// debug note so it can never break job cleanup. Supports cgroup v2 (modern,
+// memory.peak) and v1 (memory.max_usage_in_bytes), with a graceful "n/a" when
+// the kernel exposes no peak counter.
+export async function reportPeakResourceUsage(podName: string): Promise<void> {
+  const script = `
+if [ -r /sys/fs/cgroup/memory.peak ]; then echo "mem_peak=$(cat /sys/fs/cgroup/memory.peak)"; \
+elif [ -r /sys/fs/cgroup/memory/memory.max_usage_in_bytes ]; then echo "mem_peak=$(cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes)"; \
+else echo "mem_peak=na"; fi
+if [ -r /sys/fs/cgroup/memory.max ]; then echo "mem_limit=$(cat /sys/fs/cgroup/memory.max)"; \
+elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then echo "mem_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"; \
+else echo "mem_limit=na"; fi
+if [ -r /sys/fs/cgroup/cpu.stat ]; then echo "cpu_usec=$(awk '/^usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat)"; \
+elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then echo "cpu_nsec=$(cat /sys/fs/cgroup/cpuacct/cpuacct.usage)"; \
+else echo "cpu_usec=na"; fi
+`
+  let raw: string
+  try {
+    raw = await execPodCaptureStdout(
+      ['sh', '-c', script],
+      podName,
+      JOB_CONTAINER_NAME
+    )
+  } catch (err) {
+    core.debug(
+      `[usage] could not read cgroup stats: ${(err as Error)?.message ?? err}`
+    )
+    return
+  }
+
+  core.info(`[usage] ${formatResourceUsageReport(raw)}`)
+}
+
+// Resolve the PV currently bound to a PVC by reading the PVC's volumeName.
+// Must be called while the PVC still exists (i.e. before the owning pod is
+// deleted and the ephemeral PVC is garbage-collected). Returns undefined if
+// the PVC is missing or not yet bound. This is a namespaced get-by-name, so it
+// works with credentials that cannot list PVs cluster-wide.
+export async function getPvcVolumeName(
+  pvcName: string
+): Promise<string | undefined> {
+  const pvc = await k8sApi.readNamespacedPersistentVolumeClaim({
+    name: pvcName,
+    namespace: namespace()
+  })
+  return pvc.spec?.volumeName
+}
+
+// Release a single, named PV: wait (bounded) for it to reach Released after its
+// PVC is gone, then clear the stale claimRef so it returns to Available for
+// reuse. Targets exactly this PV by name (get/patch by name, no cluster-wide
+// list). Every step is logged so progress shows on the GitHub Actions UI.
+export async function releasePv(
+  pvName: string,
+  maxWaitSeconds = 60
+): Promise<void> {
+  core.info(`[pv-release] Waiting for PV ${pvName} to reach Released...`)
+  let phase: string | undefined
+  const start = Date.now()
+  while (Date.now() - start < maxWaitSeconds * 1000) {
+    const pv = await k8sApi.readPersistentVolume({ name: pvName })
+    phase = pv.status?.phase
+    if (phase === 'Released') {
+      break
+    }
+    if (phase === 'Available') {
+      core.info(`[pv-release] PV ${pvName} is already Available; nothing to do.`)
+      return
+    }
+    core.info(`[pv-release] PV ${pvName} phase=${phase}; waiting...`)
+    await sleep(2000)
+  }
+
+  if (phase !== 'Released') {
+    core.warning(
+      `[pv-release] PV ${pvName} did not reach Released within ${maxWaitSeconds}s (phase=${phase}); leaving it for the reaper.`
+    )
+    return
+  }
+
+  core.info(`[pv-release] PV ${pvName} is Released; clearing claimRef...`)
+  await k8sApi.patchPersistentVolume(
+    { name: pvName, body: { spec: { claimRef: null } } },
+    k8s.setHeaderOptions('Content-Type', k8s.PatchStrategy.MergePatch)
+  )
+  core.info(`[pv-release] PV ${pvName} released; now Available for reuse.`)
 }

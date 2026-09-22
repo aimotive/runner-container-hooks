@@ -17,6 +17,323 @@ export const EXTERNALS_VOLUME_NAME = 'externals'
 export const GITHUB_VOLUME_NAME = 'github'
 export const WORK_VOLUME = 'work'
 
+export const ENV_WORK_VOLUME_STORAGE_CLASS =
+  'ACTIONS_RUNNER_WORK_VOLUME_STORAGE_CLASS'
+export const ENV_WORK_VOLUME_SIZE = 'ACTIONS_RUNNER_WORK_VOLUME_SIZE'
+export const ENV_WORK_VOLUME_ACCESS_MODE =
+  'ACTIONS_RUNNER_WORK_VOLUME_ACCESS_MODE'
+export const DEFAULT_WORK_VOLUME_SIZE = '50Gi'
+export const DEFAULT_WORK_VOLUME_ACCESS_MODE = 'ReadWriteOnce'
+
+export const ENV_SKIP_CP_HASH_VERIFY = 'ACTIONS_RUNNER_SKIP_CP_HASH_VERIFY'
+
+export const ENV_RELEASE_WORK_VOLUME_PV = 'ACTIONS_RUNNER_RELEASE_WORK_VOLUME_PV'
+
+// When true, the cleanup-job hook releases the specific PV that backed this
+// job's work volume: it reads the bound PV name from the work-volume PVC,
+// deletes the pod (which garbage-collects the ephemeral PVC), waits for the PV
+// to reach Released, and clears its claimRef so it returns to Available. This
+// is a targeted, per-job release (no cluster-wide PV sweep) that — unlike a
+// workflow-pod sidecar — runs from the runner side and so survives job
+// cancellation. A low-frequency reaper still backstops hard-kill cases.
+export function releaseWorkVolumePvEnabled(): boolean {
+  return process.env[ENV_RELEASE_WORK_VOLUME_PV] === 'true'
+}
+
+export const ENV_REPORT_RESOURCE_USAGE = 'ACTIONS_RUNNER_REPORT_RESOURCE_USAGE'
+
+// When true, the cleanup-job hook reads the job container's cgroup peak memory
+// (and cumulative CPU) just before the pod is torn down and logs it, so the
+// GitHub UI shows actual peak usage against the configured limits. Useful for
+// right-sizing the podTemplate resources.
+export function reportResourceUsageEnabled(): boolean {
+  return process.env[ENV_REPORT_RESOURCE_USAGE] === 'true'
+}
+
+// Render a Kubernetes resources map (requests/limits) as a compact one-liner,
+// e.g. "cpu=4 memory=5Gi". Values may arrive as numbers or strings.
+export function formatResourceMap(map?: { [key: string]: unknown }): string {
+  if (!map || !Object.keys(map).length) {
+    return '(none)'
+  }
+  return Object.entries(map)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(' ')
+}
+
+// Turn the raw cgroup stdout (mem_peak=.., mem_limit=.., cpu_usec=../cpu_nsec=..)
+// into a single human-readable usage line. Pure so it can be unit-tested
+// independently of the in-cluster exec.
+export function formatResourceUsageReport(raw: string): string {
+  const fields: { [k: string]: string } = {}
+  for (const line of raw.split('\n')) {
+    const idx = line.indexOf('=')
+    if (idx > 0) {
+      fields[line.slice(0, idx).trim()] = line.slice(idx + 1).trim()
+    }
+  }
+
+  const memPeak = Number(fields['mem_peak'])
+  // cgroup v1 reports an unlimited memory limit as a huge sentinel; treat
+  // anything implausibly large (or the v2 literal "max") as "no limit".
+  const memLimitRaw = fields['mem_limit']
+  const memLimit = Number(memLimitRaw)
+  const hasLimit =
+    Number.isFinite(memLimit) &&
+    memLimitRaw !== 'max' &&
+    memLimit < 1024 ** 5 // < 1Pi → a real limit
+
+  let memMsg: string
+  if (Number.isFinite(memPeak)) {
+    const peakStr = formatBytes(memPeak)
+    if (hasLimit) {
+      const pct = Math.round((memPeak / memLimit) * 100)
+      memMsg = `peak memory: ${peakStr} / ${formatBytes(memLimit)} limit (${pct}%)`
+    } else {
+      memMsg = `peak memory: ${peakStr} (no limit)`
+    }
+  } else {
+    memMsg = 'peak memory: n/a (no cgroup peak counter on this kernel)'
+  }
+
+  let cpuMsg = ''
+  const cpuSec =
+    fields['cpu_usec'] && fields['cpu_usec'] !== 'na'
+      ? Number(fields['cpu_usec']) / 1e6
+      : fields['cpu_nsec']
+        ? Number(fields['cpu_nsec']) / 1e9
+        : NaN
+  if (Number.isFinite(cpuSec)) {
+    cpuMsg = ` | cpu: ${Math.round(cpuSec * 10) / 10}s total`
+  }
+
+  return `${memMsg}${cpuMsg}`
+}
+
+// Human-readable bytes (binary units). Returns undefined for non-finite input.
+export function formatBytes(bytes: number): string | undefined {
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return undefined
+  }
+  const units = ['B', 'Ki', 'Mi', 'Gi', 'Ti']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  const rounded = unit === 0 ? value : Math.round(value * 10) / 10
+  return `${rounded}${units[unit]}`
+}
+
+// When the work volume is a large, reused persistent volume, the per-copy
+// integrity safeguards in execCpToPod/execCpFromPod walk the entire /__w tree
+// file-by-file (a `find ... -exec stat` hash plus a `find ... -exec chmod`
+// permission fixup). On a huge retained clone these forks-per-file never
+// realistically finish, hanging "Initialize containers". Setting
+// ACTIONS_RUNNER_SKIP_CP_HASH_VERIFY=true skips both whole-tree passes: the
+// copy just extracts the (small) incoming delta and returns without verifying.
+export function skipCpHashVerify(): boolean {
+  return process.env[ENV_SKIP_CP_HASH_VERIFY] === 'true'
+}
+
+// Build the `work` volume that the job container mounts at /__w (see
+// CONTAINER_VOLUMES). By default this is an emptyDir scoped to the pod's
+// lifetime. When ACTIONS_RUNNER_WORK_VOLUME_STORAGE_CLASS is set, the volume
+// instead becomes a generic ephemeral volume whose PVC is auto-created from
+// that storage class. Backed by a statically-provisioned, Retain-policy local
+// PV pool, this lets the workspace (e.g. the git clone produced by
+// actions/checkout) persist on local disk and be reused across jobs.
+export function buildWorkVolume(): k8s.V1Volume {
+  const storageClass = process.env[ENV_WORK_VOLUME_STORAGE_CLASS]
+  if (!storageClass) {
+    return { name: WORK_VOLUME, emptyDir: {} }
+  }
+  const storage = process.env[ENV_WORK_VOLUME_SIZE] || DEFAULT_WORK_VOLUME_SIZE
+  const accessMode =
+    process.env[ENV_WORK_VOLUME_ACCESS_MODE] || DEFAULT_WORK_VOLUME_ACCESS_MODE
+  return {
+    name: WORK_VOLUME,
+    ephemeral: {
+      volumeClaimTemplate: {
+        spec: {
+          accessModes: [accessMode],
+          storageClassName: storageClass,
+          resources: {
+            requests: {
+              storage
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+export const ENV_NODE_PIN_FROM_PR_LABEL =
+  'ACTIONS_RUNNER_NODE_PIN_FROM_PR_LABEL'
+export const ENV_NODE_PIN_LABEL_PREFIX =
+  'ACTIONS_RUNNER_NODE_PIN_LABEL_PREFIX'
+export const DEFAULT_NODE_PIN_LABEL_PREFIX = 'ci:node:'
+// Workflow-facing env key (set in the workflow's `container.env`, like
+// K8S_JOB_RESOURCES). Carries the node name resolved from the PR label by the
+// workflow itself, where the event payload is always available — the hook
+// process gets neither GITHUB_EVENT_PATH nor the event file at prepare time.
+export const NODE_PIN_ENV_KEY = 'K8S_JOB_NODE'
+
+// Primary node-pin source: the K8S_JOB_NODE container env var, resolved by the
+// workflow from the `ci:node:<nodename>` PR label. Gated by the same RunnerSet
+// flag as the event-file fallback.
+export function getNodePinFromEnvList(
+  env?: k8s.V1EnvVar[]
+): string | undefined {
+  if (process.env[ENV_NODE_PIN_FROM_PR_LABEL] !== 'true') {
+    return undefined
+  }
+  const node = env?.find(e => e.name === NODE_PIN_ENV_KEY)?.value?.trim()
+  return node || undefined
+}
+
+// Locate the PR event payload on the runner. GITHUB_EVENT_PATH is not reliably
+// exported to the container hook (it comes through unset even when
+// GITHUB_EVENT_NAME is set), so fall back to the runner's well-known location
+// under RUNNER_TEMP (which the hook does receive): $RUNNER_TEMP/_github_workflow/
+// event.json, scanning the dir for any *.json if the default name differs.
+function resolvePrEventPath(): string | undefined {
+  const fromEnv = process.env['GITHUB_EVENT_PATH']
+  if (fromEnv && fs.existsSync(fromEnv)) {
+    return fromEnv
+  }
+  const runnerTemp = process.env['RUNNER_TEMP']
+  if (runnerTemp) {
+    const dir = `${runnerTemp}/_github_workflow`
+    const candidate = `${dir}/event.json`
+    if (fs.existsSync(candidate)) {
+      return candidate
+    }
+    try {
+      const json = fs.readdirSync(dir).find(n => n.endsWith('.json'))
+      if (json) {
+        return `${dir}/${json}`
+      }
+    } catch {
+      // directory missing — nothing to resolve
+    }
+  }
+  return undefined
+}
+
+// Debug helper: when enabled, redirect the workflow pod to a specific node
+// named by a pull-request label `ci:node:<nodename>` (prefix configurable).
+// Returns the node name, or undefined when disabled, not a PR event, no
+// matching label, or anything fails to parse (never breaks job prep).
+// Applied as a `kubernetes.io/hostname` nodeSelector, so the scheduler still
+// honours taints/resources (the pod stays Pending if the node can't take it).
+export function getNodePinFromPrLabel(): string | undefined {
+  if (process.env[ENV_NODE_PIN_FROM_PR_LABEL] !== 'true') {
+    return undefined
+  }
+  const eventName = process.env['GITHUB_EVENT_NAME']
+  const prefix =
+    process.env[ENV_NODE_PIN_LABEL_PREFIX] || DEFAULT_NODE_PIN_LABEL_PREFIX
+
+  if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
+    core.info(
+      `[node-pin] event='${eventName ?? '(unset)'}' is not a pull_request; skipping`
+    )
+    return undefined
+  }
+
+  const eventPath = resolvePrEventPath()
+  core.info(
+    `[node-pin] enabled; event='${eventName}' eventPath='${eventPath ?? '(not found)'}' prefix='${prefix}'`
+  )
+  if (!eventPath) {
+    core.info(
+      `[node-pin] could not locate the PR event payload (GITHUB_EVENT_PATH unset, RUNNER_TEMP='${process.env['RUNNER_TEMP'] ?? '(unset)'}')`
+    )
+    return undefined
+  }
+
+  try {
+    const payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
+    const labels = payload?.pull_request?.labels
+    if (!Array.isArray(labels)) {
+      core.info(`[node-pin] no pull_request.labels array in event payload`)
+      return undefined
+    }
+    const names = labels
+      .map((l: { name?: string }) => l?.name)
+      .filter((n: unknown): n is string => typeof n === 'string')
+    core.info(`[node-pin] PR labels: ${names.join(', ') || '(none)'}`)
+
+    const matches = names.filter(n => n.startsWith(prefix))
+    if (!matches.length) {
+      core.info(`[node-pin] no label with prefix '${prefix}'`)
+      return undefined
+    }
+    if (matches.length > 1) {
+      core.warning(
+        `[node-pin] multiple '${prefix}' labels found (${matches.join(', ')}); using the first`
+      )
+    }
+    const node = matches[0].slice(prefix.length).trim()
+    if (!node) {
+      core.info(`[node-pin] label '${matches[0]}' has an empty node name`)
+      return undefined
+    }
+    return node
+  } catch (err) {
+    core.warning(
+      `[node-pin] could not read PR labels from ${eventPath}: ${(err as Error)?.message ?? err}`
+    )
+    return undefined
+  }
+}
+
+export const ENV_ALLOW_JOB_RESOURCES = 'ACTIONS_RUNNER_ALLOW_JOB_RESOURCES'
+// Workflow-facing env key (set in the workflow's `container.env`), NOT a
+// RunnerSet env var. Holds a JSON V1ResourceRequirements object.
+export const JOB_RESOURCES_ENV_KEY = 'K8S_JOB_RESOURCES'
+
+// Let a workflow override the job container's resources from its own YAML
+// (e.g. per matrix axis) via a JSON env var, without one RunnerSet per axis.
+// `container.resources` is not valid GitHub Actions syntax and never reaches
+// the hook, so the value is carried as an env var in `container.env`. Gated by
+// the RunnerSet flag ACTIONS_RUNNER_ALLOW_JOB_RESOURCES so the admin controls
+// whether workflows may set their own resources. Returns undefined (→ fall back
+// to the podTemplate resources) when disabled, unset, or unparseable.
+export function parseJobResourcesFromEnv(envVars?: {
+  [key: string]: string
+}): k8s.V1ResourceRequirements | undefined {
+  if (process.env[ENV_ALLOW_JOB_RESOURCES] !== 'true') {
+    return undefined
+  }
+  const raw = envVars?.[JOB_RESOURCES_ENV_KEY]
+  if (!raw) {
+    core.info(
+      `[resources] ALLOW_JOB_RESOURCES enabled but ${JOB_RESOURCES_ENV_KEY} not present in the container env (${Object.keys(envVars ?? {}).length} env var(s) received); using podTemplate resources`
+    )
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error('not an object')
+    }
+    if (parsed.requests === undefined && parsed.limits === undefined) {
+      throw new Error('expected "requests" and/or "limits"')
+    }
+    core.info(`[resources] applying workflow-provided ${JOB_RESOURCES_ENV_KEY}`)
+    return parsed as k8s.V1ResourceRequirements
+  } catch (err) {
+    core.warning(
+      `[resources] ignoring invalid ${JOB_RESOURCES_ENV_KEY}: ${(err as Error)?.message ?? err}`
+    )
+    return undefined
+  }
+}
+
 export const CONTAINER_VOLUMES: k8s.V1VolumeMount[] = [
   {
     name: EXTERNALS_VOLUME_NAME,

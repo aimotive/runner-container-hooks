@@ -22,8 +22,10 @@ import {
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
   formatError,
+  formatResourceMap,
   generateContainerName,
   mergeContainerWithOptions,
+  parseJobResourcesFromEnv,
   readExtensionFromFile,
   PodPhase,
   fixArgs,
@@ -91,6 +93,19 @@ export async function prepareJob(
   }
 
   let createdPod: k8s.V1Pod | undefined = undefined
+  core.info(
+    `Creating workflow pod ${getJobPodName()}` +
+      (container?.image ? ` (job image: ${container.image})` : '') +
+      (services?.length
+        ? `, services: ${services.map(s => s.image).join(', ')}`
+        : '')
+  )
+  if (container) {
+    core.info(
+      `[resources] job container requests: ${formatResourceMap(container.resources?.requests)} | ` +
+        `limits: ${formatResourceMap(container.resources?.limits)}`
+    )
+  }
   try {
     createdPod = await createJobPod(
       getJobPodName(),
@@ -109,8 +124,8 @@ export async function prepareJob(
   if (!createdPod?.metadata?.name) {
     throw new Error('created pod should have metadata.name')
   }
-  core.debug(
-    `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
+  core.info(
+    `Workflow pod ${createdPod.metadata.name} created; waiting for it to come online...`
   )
 
   const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE as string)
@@ -132,7 +147,9 @@ export async function prepareJob(
     throw new Error(`pod failed to come online with error: ${formatError(err)}`)
   }
 
+  core.info(`Copying runner workspace (${runnerWorkspace}) into pod /__w ...`)
   await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
+  core.info('Workspace ready in pod')
 
   if (prepareScript) {
     await execPodStep(
@@ -286,16 +303,21 @@ export function createContainerSpec(
 
   podContainer.volumeMounts = CONTAINER_VOLUMES
 
-  if (!extension) {
-    return podContainer
+  if (extension) {
+    const from = extension.spec?.containers?.find(
+      c => c.name === CONTAINER_EXTENSION_PREFIX + name
+    )
+    if (from) {
+      mergeContainerWithOptions(podContainer, from)
+    }
   }
 
-  const from = extension.spec?.containers?.find(
-    c => c.name === CONTAINER_EXTENSION_PREFIX + name
-  )
-
-  if (from) {
-    mergeContainerWithOptions(podContainer, from)
+  // Optional per-job resource override driven from the workflow (gated by
+  // ACTIONS_RUNNER_ALLOW_JOB_RESOURCES). Applied last so it wins over the
+  // podTemplate $job resources; no-op when disabled/unset.
+  const jobResources = parseJobResourcesFromEnv(container['environmentVariables'])
+  if (jobResources) {
+    podContainer.resources = jobResources
   }
 
   return podContainer
