@@ -18,6 +18,7 @@ import {
   execPodStep
 } from '../k8s'
 import {
+  clearStaleTempCommand,
   CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
@@ -145,6 +146,20 @@ export async function prepareJob(
   } catch (err) {
     await prunePods()
     throw new Error(`pod failed to come online with error: ${formatError(err)}`)
+  }
+
+  // A persistent work volume keeps /__w/_temp from earlier jobs. Start from a
+  // clean _temp like the runner does; best-effort, a failure only costs speed.
+  try {
+    await execPodStep(
+      ['sh', '-c', clearStaleTempCommand('/__w')],
+      createdPod.metadata.name,
+      JOB_CONTAINER_NAME
+    )
+  } catch (err) {
+    core.warning(
+      `Failed to clear stale /__w/_temp in the job pod: ${formatError(err)}`
+    )
   }
 
   core.info(`Copying runner workspace (${runnerWorkspace}) into pod /__w ...`)

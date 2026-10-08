@@ -520,16 +520,20 @@ export async function execCpToPod(
       // file-by-file. On a large reused persistent /__w that is prohibitively
       // slow (one fork per file), so when verification is disabled we extract
       // the incoming delta only and skip the whole-tree permission fixup.
+      //
+      // The target dir is created in the same exec so callers don't need a
+      // separate (API-server round-trip) mkdir before copying.
+      const mkdir = `mkdir -p ${shlex.quote(containerPath)} && `
       const command = skipVerify
         ? [
             'sh',
             '-c',
-            `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null`
+            `${mkdir}tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null`
           ]
         : [
             'sh',
             '-c',
-            `tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
+            `${mkdir}tar xf - --no-same-owner -C ${shlex.quote(containerPath)} 2>/dev/null; ` +
               `find ${shlex.quote(containerPath)} -type f -exec chmod u+rw {} \\; 2>/dev/null; ` +
               `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
           ]

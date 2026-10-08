@@ -7,7 +7,8 @@ import {
   formatError,
   writeRunScript,
   sleep,
-  listDirAllCommand
+  listDirAllCommand,
+  mergeTempDirCommand
 } from '../k8s/utils'
 import { JOB_CONTAINER_NAME } from './constants'
 import { dirname } from 'path'
@@ -31,46 +32,12 @@ export async function runScriptStep(
   const runnerTemp = `${workdir}/_temp`
   const containerTemp = '/__w/_temp'
   const containerTempSrc = '/__w/_temp_pre'
-  // Ensure base and staging dirs exist before copying
-  await execPodStep(
-    [
-      'sh',
-      '-c',
-      'mkdir -p /__w && mkdir -p /__w/_temp && mkdir -p /__w/_temp_pre'
-    ],
-    state.jobPod,
-    JOB_CONTAINER_NAME
-  )
+  // execCpToPod creates the staging dir itself, so no separate mkdir exec.
   await execCpToPod(state.jobPod, runnerTemp, containerTempSrc)
-
-  // Copy GitHub directories from temp to /github
-  // Merge strategy:
-  // - Overwrite files in _runner_file_commands
-  // - Append files not already present elsewhere
-  const mergeCommands = [
-    'set -e',
-    'mkdir -p /__w/_temp /__w/_temp_pre',
-    'SRC=/__w/_temp_pre',
-    'DST=/__w/_temp',
-    // _runner_file_commands may not exist yet (e.g. first step of a job, or
-    // an empty directory dropped by the tar-based pod copy), so create both
-    // sides before merging instead of assuming the source is present.
-    'mkdir -p "$SRC/_runner_file_commands" "$DST/_runner_file_commands"',
-    // Overwrite _runner_file_commands
-    'cp -a "$SRC/_runner_file_commands/." "$DST/_runner_file_commands"',
-    `find "$SRC" -type f ! -path "*/_runner_file_commands/*" -exec sh -c '
-    rel="\${1#$2/}"
-    target="$3/$rel"
-    mkdir -p "$(dirname "$target")"
-    cp -a "$1" "$target"
-  ' _ {} "$SRC" "$DST" \\;`,
-    // Remove _temp_pre after merging
-    'rm -rf /__w/_temp_pre'
-  ]
 
   try {
     await execPodStep(
-      ['sh', '-c', mergeCommands.join(' && ')],
+      ['sh', '-c', mergeTempDirCommand(containerTempSrc, containerTemp)],
       state.jobPod,
       JOB_CONTAINER_NAME
     )

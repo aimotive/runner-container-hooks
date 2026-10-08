@@ -621,6 +621,51 @@ export function listDirAllCommand(dir: string): string {
   return `cd ${shlex.quote(dir)} && find . -type f -not -path '*/_runner_hook_responses*' -exec stat -c '%s %n' {} \\;`
 }
 
+// Shell script that folds the runner's _temp, staged in the pod at `src`, into
+// the pod's _temp at `dst` before a script step runs.
+//
+// _runner_file_commands is REPLACED rather than merged. The runner creates a
+// fresh set of file-command files for every step and only reads back the
+// current step's set, but the hook copies the whole directory back after each
+// step. Merging made it grow by ~7 files per step — and, on a persistent work
+// volume, by every step of every earlier job that used the volume — so each
+// step round-tripped thousands of stale files through the API server, costing
+// tens of seconds to minutes per step.
+//
+// The rest of _temp is copied with a single `cp -a` instead of forking a shell,
+// mkdir and cp for every file.
+export function mergeTempDirCommand(src: string, dst: string): string {
+  const s = shlex.quote(src)
+  const d = shlex.quote(dst)
+  return [
+    'set -e',
+    // The source side may be missing when the tar-based copy drops an empty
+    // directory (e.g. the first step of a job).
+    `mkdir -p ${s}/_runner_file_commands ${d}`,
+    `rm -rf ${d}/_runner_file_commands`,
+    `mv ${s}/_runner_file_commands ${d}/_runner_file_commands`,
+    `cp -a ${s}/. ${d}/`,
+    `rm -rf ${s}`
+  ].join('\n')
+}
+
+// Shell script that removes the hook's _temp staging dirs under `workDir`. On
+// a persistent work volume they still hold what earlier jobs left behind
+// (file-command files, step scripts, hook responses); a new job needs none of
+// it, as the runner's own _temp is copied in right afterwards. Prints how many
+// files were dropped so the effect shows up in the job log.
+export function clearStaleTempCommand(workDir: string): string {
+  const temp = shlex.quote(`${workDir}/_temp`)
+  const tempPre = shlex.quote(`${workDir}/_temp_pre`)
+  return [
+    `if [ -e ${temp} ] || [ -e ${tempPre} ]; then`,
+    `  n=$(find ${temp} ${tempPre} -type f 2>/dev/null | wc -l | tr -d ' ')`,
+    `  rm -rf ${temp} ${tempPre}`,
+    `  echo "Removed $n stale file(s) left in ${workDir}/_temp by earlier jobs"`,
+    'fi'
+  ].join('\n')
+}
+
 // Safely turn an unknown thrown value into a diagnostic string without
 // throwing. The previous `JSON.stringify(err)` pattern crashed with
 // `TypeError: Converting circular structure to JSON` when err was a
