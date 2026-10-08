@@ -1,0 +1,36 @@
+# Builds an actions-runner image with the custom k8s-novolume container hook
+# baked in. The hook adds support for backing the workflow pod's `work` volume
+# (/__w) with a persistent, reusable local PV via the
+# ACTIONS_RUNNER_WORK_VOLUME_STORAGE_CLASS env var (set on the runner).
+#
+# Build (from the repo root):
+#   docker build -f Dockerfile.novolume-runner -t actions-runner:v2.335.1-hooks1 .
+#
+# The base runner image defaults to the official upstream release. Override
+# BASE_IMAGE to pull it from a private mirror, e.g.:
+#   docker build -f Dockerfile.novolume-runner \
+#     --build-arg BASE_IMAGE=<registry>/actions-runner:v2.335.1 -t <image> .
+#
+# The runner is then pointed at it via the RunnerSet `template.spec.containers`
+# image, keeping ACTIONS_RUNNER_CONTAINER_HOOKS=/home/runner/k8s-novolume/index.js.
+
+# Official GitHub Actions runner. Declared before the first FROM so it is usable
+# as the base image below; override at build time to use a private mirror.
+ARG BASE_IMAGE=ghcr.io/actions/actions-runner:v2.335.1
+
+# ---- build the hook bundle ------------------------------------------------
+FROM node:20-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN npm ci --prefix packages/hooklib \
+ && npm run build --prefix packages/hooklib \
+ && npm ci --prefix packages/k8s \
+ && npm run build --prefix packages/k8s
+
+# ---- assemble the runner image --------------------------------------------
+FROM ${BASE_IMAGE}
+
+# Replace the stock novolume hook with our build. ncc emits a single bundled
+# index.js (no native addons), so this file is the entire hook.
+COPY --from=build --chown=1001:0 /src/packages/k8s/dist/index.js \
+  /home/runner/k8s-novolume/index.js
