@@ -15,7 +15,8 @@ import {
   waitForPodPhases,
   getPrepareJobTimeoutSeconds,
   execCpToPod,
-  execPodStep
+  execPodStep,
+  logPodPlacement
 } from '../k8s'
 import {
   clearStaleTempCommand,
@@ -148,6 +149,8 @@ export async function prepareJob(
     throw new Error(`pod failed to come online with error: ${formatError(err)}`)
   }
 
+  await logPodPlacement(createdPod.metadata.name)
+
   // A persistent work volume keeps /__w/_temp from earlier jobs. Start from a
   // clean _temp like the runner does; best-effort, a failure only costs speed.
   try {
@@ -163,8 +166,11 @@ export async function prepareJob(
   }
 
   core.info(`Copying runner workspace (${runnerWorkspace}) into pod /__w ...`)
+  const copyStart = Date.now()
   await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
-  core.info('Workspace ready in pod')
+  core.info(
+    `Workspace ready in pod (${((Date.now() - copyStart) / 1000).toFixed(1)}s)`
+  )
 
   if (prepareScript) {
     await execPodStep(

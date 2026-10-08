@@ -5,7 +5,6 @@ import { spawn } from 'child_process'
 import * as k8s from '@kubernetes/client-node'
 import tar from 'tar-fs'
 import * as stream from 'stream'
-import { WritableStreamBuffer } from 'stream-buffers'
 import { createHash } from 'crypto'
 import type { ContainerInfo, Registry } from 'hooklib'
 import {
@@ -26,6 +25,10 @@ import {
   formatResourceUsageReport,
   getNodePinFromPrLabel,
   getNodePinFromEnvList,
+  createStringSink,
+  execStatusExitCode,
+  withExitCode,
+  ENV_WORK_VOLUME_STORAGE_CLASS,
   EXTERNALS_VOLUME_NAME,
   GITHUB_VOLUME_NAME,
   WORK_VOLUME
@@ -361,7 +364,12 @@ export async function execPodStep(
               `[execPodStep] Failure: ${JSON.stringify({ message: resp?.message, details: resp?.details })}`
             )
             await closeWebSocket()
-            reject(new Error(resp?.message || 'execPodStep failed'))
+            reject(
+              withExitCode(
+                new Error(resp?.message || 'execPodStep failed'),
+                execStatusExitCode(resp)
+              )
+            )
           }
         }
       )
@@ -504,7 +512,7 @@ export async function execCpToPod(
   containerPath: string
 ): Promise<void> {
   const skipVerify = skipCpHashVerify()
-  core.info(
+  core.debug(
     `Copying ${runnerPath} into pod ${podName}:${containerPath}` +
       (skipVerify ? ' (hash verify + chmod fixup disabled)' : '')
   )
@@ -538,7 +546,7 @@ export async function execCpToPod(
               `find ${shlex.quote(containerPath)} -type d -exec chmod u+rwx {} \\; 2>/dev/null`
           ]
       const readStream = tar.pack(runnerPath)
-      const errStream = new WritableStreamBuffer()
+      const errStream = createStringSink()
       await new Promise((resolve, reject) => {
         exec
           .exec(
@@ -547,14 +555,14 @@ export async function execCpToPod(
             JOB_CONTAINER_NAME,
             command,
             null,
-            errStream,
+            errStream.stream,
             readStream,
             false,
             async status => {
               if (errStream.size()) {
                 reject(
                   new Error(
-                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.getContentsAsString()}`
+                    `Error from execCpToPod - status: ${status.status}, details: \n ${errStream.contents()}`
                   )
                 )
               }
@@ -577,7 +585,7 @@ export async function execCpToPod(
   }
 
   if (skipVerify) {
-    core.info(`Copied ${runnerPath} into ${podName}:${containerPath}`)
+    core.debug(`Copied ${runnerPath} into ${podName}:${containerPath}`)
     return
   }
 
@@ -670,7 +678,7 @@ export async function execCpFromPod(
       const writerStream = tar.extract(parentRunnerPath, {
         map: remapOwnership
       })
-      const errStream = new WritableStreamBuffer()
+      const errStream = createStringSink()
 
       await new Promise((resolve, reject) => {
         // Resolve only once BOTH the exec has reported completion AND the local
@@ -704,14 +712,14 @@ export async function execCpFromPod(
             JOB_CONTAINER_NAME,
             command,
             writerStream,
-            errStream,
+            errStream.stream,
             null,
             false,
             async status => {
               if (errStream.size()) {
                 reject(
                   new Error(
-                    `Error from cpFromPod - details: \n ${errStream.getContentsAsString()}`
+                    `Error from cpFromPod - details: \n ${errStream.contents()}`
                   )
                 )
                 return
@@ -1279,6 +1287,35 @@ export async function getPvcVolumeName(
     namespace: namespace()
   })
   return pvc.spec?.volumeName
+}
+
+// Tell the user where the job runs: the node the job pod landed on and, with a
+// persistent work volume, which PV backs /__w (it is reused across jobs, which
+// explains files left over from earlier runs). Best-effort, never fatal.
+export async function logPodPlacement(podName: string): Promise<void> {
+  try {
+    const node = (await getPodByName(podName)).spec?.nodeName
+    if (node) {
+      core.info(`Job pod ${podName} is running on node ${node}`)
+    }
+  } catch (err) {
+    core.debug(`Could not read the node of pod ${podName}: ${formatError(err)}`)
+  }
+
+  const storageClass = process.env[ENV_WORK_VOLUME_STORAGE_CLASS]
+  if (!storageClass) {
+    return
+  }
+  try {
+    const pv = await getPvcVolumeName(`${podName}-work`)
+    if (pv) {
+      core.info(
+        `Workspace /__w is on persistent volume ${pv} (storage class ${storageClass}), reused across jobs`
+      )
+    }
+  } catch (err) {
+    core.debug(`Could not read the work volume PV: ${formatError(err)}`)
+  }
 }
 
 // Release a single, named PV: wait (bounded) for it to reach Released after its

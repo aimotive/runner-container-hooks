@@ -5,6 +5,7 @@ import * as core from '@actions/core'
 import { v1 as uuidv4 } from 'uuid'
 import { CONTAINER_EXTENSION_PREFIX } from '../hooks/constants'
 import * as shlex from 'shlex'
+import * as stream from 'stream'
 import { Mount } from 'hooklib'
 
 export const DEFAULT_CONTAINER_ENTRY_POINT_ARGS = [`-f`, `/dev/null`]
@@ -238,18 +239,18 @@ export function getNodePinFromPrLabel(): string | undefined {
     process.env[ENV_NODE_PIN_LABEL_PREFIX] || DEFAULT_NODE_PIN_LABEL_PREFIX
 
   if (eventName !== 'pull_request' && eventName !== 'pull_request_target') {
-    core.info(
+    core.debug(
       `[node-pin] event='${eventName ?? '(unset)'}' is not a pull_request; skipping`
     )
     return undefined
   }
 
   const eventPath = resolvePrEventPath()
-  core.info(
+  core.debug(
     `[node-pin] enabled; event='${eventName}' eventPath='${eventPath ?? '(not found)'}' prefix='${prefix}'`
   )
   if (!eventPath) {
-    core.info(
+    core.debug(
       `[node-pin] could not locate the PR event payload (GITHUB_EVENT_PATH unset, RUNNER_TEMP='${process.env['RUNNER_TEMP'] ?? '(unset)'}')`
     )
     return undefined
@@ -259,17 +260,17 @@ export function getNodePinFromPrLabel(): string | undefined {
     const payload = JSON.parse(fs.readFileSync(eventPath, 'utf8'))
     const labels = payload?.pull_request?.labels
     if (!Array.isArray(labels)) {
-      core.info(`[node-pin] no pull_request.labels array in event payload`)
+      core.debug(`[node-pin] no pull_request.labels array in event payload`)
       return undefined
     }
     const names = labels
       .map((l: { name?: string }) => l?.name)
       .filter((n: unknown): n is string => typeof n === 'string')
-    core.info(`[node-pin] PR labels: ${names.join(', ') || '(none)'}`)
+    core.debug(`[node-pin] PR labels: ${names.join(', ') || '(none)'}`)
 
     const matches = names.filter(n => n.startsWith(prefix))
     if (!matches.length) {
-      core.info(`[node-pin] no label with prefix '${prefix}'`)
+      core.debug(`[node-pin] no label with prefix '${prefix}'`)
       return undefined
     }
     if (matches.length > 1) {
@@ -664,6 +665,86 @@ export function clearStaleTempCommand(workDir: string): string {
     `  echo "Removed $n stale file(s) left in ${workDir}/_temp by earlier jobs"`,
     'fi'
   ].join('\n')
+}
+
+// In-memory sink for an exec's stderr. Replaces stream-buffers, whose
+// WritableStreamBuffer still allocates with the deprecated `new Buffer()` and
+// so put a DEP0005 warning into every step's log.
+export function createStringSink(): {
+  stream: stream.Writable
+  size: () => number
+  contents: () => string
+} {
+  const chunks: Buffer[] = []
+  return {
+    stream: new stream.Writable({
+      write(chunk, _enc, cb) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+        cb()
+      }
+    }),
+    size: () => chunks.reduce((n, c) => n + c.length, 0),
+    contents: () => Buffer.concat(chunks).toString('utf8')
+  }
+}
+
+// Exit code of a command run through the pod exec API, taken from its final
+// V1Status (details.causes: [{ reason: 'ExitCode', message: '<n>' }]).
+// Undefined when the exec failed for another reason, e.g. the pod is gone.
+export function execStatusExitCode(status?: k8s.V1Status): number | undefined {
+  const cause = status?.details?.causes?.find(c => c.reason === 'ExitCode')
+  const code = Number(cause?.message)
+  return Number.isInteger(code) && code > 0 ? code : undefined
+}
+
+// execPodStep errors carry the command's exit code when the command itself
+// ran and failed, so callers can tell a failing step from an infrastructure
+// failure. A plain property rather than an Error subclass: the ES5 build
+// breaks instanceof for subclasses of Error.
+export function withExitCode(err: Error, exitCode?: number): Error {
+  if (exitCode !== undefined) {
+    ;(err as Error & { exitCode?: number }).exitCode = exitCode
+  }
+  return err
+}
+
+export function exitCodeOf(err: unknown): number | undefined {
+  const code = (err as { exitCode?: unknown } | undefined)?.exitCode
+  return typeof code === 'number' ? code : undefined
+}
+
+// Copying step files to and from the job pod normally takes well under a
+// second; above this it is worth telling the user where the time went.
+export const SLOW_SYNC_SECONDS = 5
+
+// User-facing note for a step whose file sync with the job pod was slow, so
+// infrastructure overhead isn't mistaken for the step itself being slow.
+export function slowSyncNotice(
+  beforeSeconds: number,
+  afterSeconds: number
+): string | undefined {
+  const total = beforeSeconds + afterSeconds
+  if (total < SLOW_SYNC_SECONDS) {
+    return undefined
+  }
+  return (
+    `Note: the runner spent ${total.toFixed(1)}s moving step files to and from ` +
+    `the job pod (${beforeSeconds.toFixed(1)}s before, ${afterSeconds.toFixed(1)}s after the step). ` +
+    `This is infrastructure overhead, not time spent in your step.`
+  )
+}
+
+// User-facing hint for step exit codes whose cause isn't obvious from the
+// step's own output.
+export function exitCodeHint(exitCode: number): string | undefined {
+  if (exitCode === 137) {
+    return (
+      'Exit code 137: the process was killed (SIGKILL). In a Kubernetes job pod ' +
+      'this is most often the out-of-memory killer; the job container memory ' +
+      'limit is shown under "Initialize containers".'
+    )
+  }
+  return undefined
 }
 
 // Safely turn an unknown thrown value into a diagnostic string without
