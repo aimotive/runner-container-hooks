@@ -36,6 +36,7 @@ import {
 import * as shlex from 'shlex'
 import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
 import type { HeartbeatWebSocket } from './heartbeat'
+import { logRunnerPlacement } from './placement'
 
 const kc = new k8s.KubeConfig()
 
@@ -1289,10 +1290,12 @@ export async function getPvcVolumeName(
   return pvc.spec?.volumeName
 }
 
-// Tell the user where the job runs: the node the job pod landed on and, with a
-// persistent work volume, which PV backs /__w (it is reused across jobs, which
-// explains files left over from earlier runs). Best-effort, never fatal.
+// Tell the user where the job runs: the node the runner pod and the job pod
+// landed on and, with a persistent work volume, which PV backs /__w (it is
+// reused across jobs, which explains files left over from earlier runs).
+// Best-effort, never fatal.
 export async function logPodPlacement(podName: string): Promise<void> {
+  await logRunnerPlacement(getPodByName)
   try {
     const node = (await getPodByName(podName)).spec?.nodeName
     if (node) {
