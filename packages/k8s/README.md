@@ -35,6 +35,18 @@ rules:
     - `GITHUB_WORKSPACE` is expected to be set to the workspace of the job
 
 
+## Where a job runs
+
+GitHub only knows a runner by its pod's name, and a runner pod is not told its own node. The hooks say both pods' nodes in the job's log, in lines a reader (or a dashboard) can rely on:
+
+```
+Runner pod <runner pod> is running on node <node>
+Job pod <runner pod>-workflow is running on node <node>
+```
+
+- "Initialize containers" (`prepare_job`) prints both, for a job with a container.
+- A job without a container runs its steps in the runner pod, and no hook runs for it. `job-started.sh`, set as the runner's job-started hook, covers it: `ACTIONS_RUNNER_HOOK_JOB_STARTED=<dir>/job-started.sh`, with the bundle's `index.js` beside it. Every job's "Set up runner" step then prints the runner pod's line. It runs `index.js job-started`, which reads the runner pod (`ACTIONS_RUNNER_POD_NAME`) with the pod's own service account — the `get pods` the hooks already need — and never fails the job.
+
 ## Limitations
 - A [job containers](https://docs.github.com/en/actions/using-jobs/running-jobs-in-a-container) will be required for all jobs
 - Building container actions from a dockerfile is not supported at this time
