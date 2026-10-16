@@ -28,7 +28,8 @@ export const DEFAULT_WORK_VOLUME_ACCESS_MODE = 'ReadWriteOnce'
 
 export const ENV_SKIP_CP_HASH_VERIFY = 'ACTIONS_RUNNER_SKIP_CP_HASH_VERIFY'
 
-export const ENV_RELEASE_WORK_VOLUME_PV = 'ACTIONS_RUNNER_RELEASE_WORK_VOLUME_PV'
+export const ENV_RELEASE_WORK_VOLUME_PV =
+  'ACTIONS_RUNNER_RELEASE_WORK_VOLUME_PV'
 
 // When true, the cleanup-job hook releases the specific PV that backed this
 // job's work volume: it reads the bound PV name from the work-volume PVC,
@@ -43,12 +44,111 @@ export function releaseWorkVolumePvEnabled(): boolean {
 
 export const ENV_REPORT_RESOURCE_USAGE = 'ACTIONS_RUNNER_REPORT_RESOURCE_USAGE'
 
-// When true, the cleanup-job hook reads the job container's cgroup peak memory
-// (and cumulative CPU) just before the pod is torn down and logs it, so the
+// When true, the prepare-job hook starts a small sampler in the job container
+// and the cleanup-job hook reads what it saw, with the cgroup's own peak and
+// the cumulative CPU, just before the pod is torn down, and logs it, so the
 // GitHub UI shows actual peak usage against the configured limits. Useful for
 // right-sizing the podTemplate resources.
 export function reportResourceUsageEnabled(): boolean {
   return process.env[ENV_REPORT_RESOURCE_USAGE] === 'true'
+}
+
+// The job container's cgroup (its cgroup namespace makes it the root) and the
+// file in it the sampler keeps its peaks in.
+export const JOB_CGROUP_DIR = '/sys/fs/cgroup'
+export const USAGE_PEAKS_FILE = '/tmp/.runner-usage-peaks'
+export const USAGE_SAMPLE_INTERVAL_SECONDS = 2
+
+// cgroup v2's memory.peak is no measure of what a job needed: the page cache
+// is in it, and the kernel lets the cache grow up to memory.max before it
+// reclaims any, so a job that reads or writes more files than its limit (a
+// checkout, a build, a package download) peaks at exactly its limit. Nor can
+// the cache be taken out of the peak afterwards. So a sampler keeps two peaks
+// of its own, from memory.current and memory.stat:
+//   held         memory.current less the page cache (`file`, which counts tmpfs
+//                and shm in, so `shmem` goes back in) and less the reclaimable
+//                slab: what the kernel cannot give back without swap, what an
+//                OOM kill is about.
+//   working set  memory.current less the inactive page cache, the kubelet's
+//                measure, which its evictions and workflow-dashboard's build
+//                report go by.
+// One sample: reads the peaks so far from the file, writes them back when a
+// new sample beats them. POSIX sh and coreutils only: the job image is any.
+export function usageSampleCommand(
+  cgroupDir = JOB_CGROUP_DIR,
+  peaksFile = USAGE_PEAKS_FILE
+): string {
+  const cg = shlex.quote(cgroupDir)
+  const f = shlex.quote(peaksFile)
+  return [
+    `cur=$(cat ${cg}/memory.current 2>/dev/null) || exit 0`,
+    'file=0 shmem=0 inactive=0 slab=0 held_peak=0 ws_peak=0',
+    'while read -r k v; do',
+    '  case $k in',
+    '    file) file=$v ;; shmem) shmem=$v ;;',
+    '    inactive_file) inactive=$v ;; slab_reclaimable) slab=$v ;;',
+    '  esac',
+    `done < ${cg}/memory.stat`,
+    `[ -r ${f} ] && while IFS== read -r k v; do`,
+    '  case $k in held_peak) held_peak=$v ;; ws_peak) ws_peak=$v ;; esac',
+    `done < ${f}`,
+    'held=$((cur - file + shmem - slab)); ws=$((cur - inactive))',
+    'if [ "$held" -gt "$held_peak" ] || [ "$ws" -gt "$ws_peak" ]; then',
+    '  [ "$held" -gt "$held_peak" ] && held_peak=$held',
+    '  [ "$ws" -gt "$ws_peak" ] && ws_peak=$ws',
+    `  printf 'held_peak=%s\\nws_peak=%s\\n' "$held_peak" "$ws_peak" > ${f}.tmp && mv ${f}.tmp ${f}`,
+    'fi'
+  ].join('\n')
+}
+
+// Starts the sampler in the background and returns at once. Its descriptors
+// go to /dev/null so the exec's stream can close; the loop outlives the exec
+// and ends with the container, or once its cgroup is unreadable. cgroup v1 has
+// no memory.stat `file` to take the cache out with: there the sampler does not
+// start, and the report says only the cgroup's peak.
+export function usageSamplerStartCommand(
+  cgroupDir = JOB_CGROUP_DIR,
+  peaksFile = USAGE_PEAKS_FILE,
+  intervalSeconds = USAGE_SAMPLE_INTERVAL_SECONDS
+): string {
+  const loop = [
+    `while [ -r ${shlex.quote(`${cgroupDir}/memory.current`)} ]; do`,
+    `( ${usageSampleCommand(cgroupDir, peaksFile)} )`,
+    `sleep ${intervalSeconds}`,
+    'done'
+  ].join('\n')
+  return [
+    `[ -r ${shlex.quote(`${cgroupDir}/memory.stat`)} ] || exit 0`,
+    `rm -f ${shlex.quote(peaksFile)}`,
+    `sh -c ${shlex.quote(loop)} </dev/null >/dev/null 2>&1 &`
+  ].join('\n')
+}
+
+// What the cleanup-job hook reads: the sampler's peaks (a last sample first,
+// for whatever came after its last one), the cgroup's peak and limit, how
+// often the job hit the limit and how many of its processes the OOM killer
+// took, and its CPU time. cgroup v1 gives the peak, limit and CPU only.
+export function usageReadCommand(
+  cgroupDir = JOB_CGROUP_DIR,
+  peaksFile = USAGE_PEAKS_FILE
+): string {
+  const cg = shlex.quote(cgroupDir)
+  const f = shlex.quote(peaksFile)
+  return `
+if [ -r ${f} ]; then ( ${usageSampleCommand(cgroupDir, peaksFile)} ); cat ${f}; fi
+if [ -r ${cg}/memory.peak ]; then echo "mem_peak=$(cat ${cg}/memory.peak)"; \
+elif [ -r ${cg}/memory/memory.max_usage_in_bytes ]; then echo "mem_peak=$(cat ${cg}/memory/memory.max_usage_in_bytes)"; \
+else echo "mem_peak=na"; fi
+if [ -r ${cg}/memory.max ]; then echo "mem_limit=$(cat ${cg}/memory.max)"; \
+elif [ -r ${cg}/memory/memory.limit_in_bytes ]; then echo "mem_limit=$(cat ${cg}/memory/memory.limit_in_bytes)"; \
+else echo "mem_limit=na"; fi
+if [ -r ${cg}/memory.events ]; then while read -r k v; do \
+case $k in max) echo "mem_max_events=$v" ;; oom_kill) echo "oom_kills=$v" ;; esac; \
+done < ${cg}/memory.events; fi
+if [ -r ${cg}/cpu.stat ]; then echo "cpu_usec=$(awk '/^usage_usec/{print $2}' ${cg}/cpu.stat)"; \
+elif [ -r ${cg}/cpuacct/cpuacct.usage ]; then echo "cpu_nsec=$(cat ${cg}/cpuacct/cpuacct.usage)"; \
+else echo "cpu_usec=na"; fi
+`
 }
 
 // Render a Kubernetes resources map (requests/limits) as a compact one-liner,
@@ -62,9 +162,15 @@ export function formatResourceMap(map?: { [key: string]: unknown }): string {
     .join(' ')
 }
 
-// Turn the raw cgroup stdout (mem_peak=.., mem_limit=.., cpu_usec=../cpu_nsec=..)
-// into a single human-readable usage line. Pure so it can be unit-tested
-// independently of the in-cluster exec.
+// Turn what usageReadCommand printed into a single human-readable usage line.
+// Pure so it can be unit-tested independently of the in-cluster exec. The line
+// starts "peak memory: <peak> / <limit> limit": workflow-dashboard reads the
+// two from there. That peak is the memory held where the sampler ran, and the
+// cgroup's own, page cache and all, only where it did not:
+//
+//   peak memory: 6.5Gi / 60Gi limit (11%) held, page cache left out | working
+//   set peak: 23.5Gi | with the page cache: 60Gi, the limit reached 312 times,
+//   0 OOM kills | cpu: 2130s total
 export function formatResourceUsageReport(raw: string): string {
   const fields: { [k: string]: string } = {}
   for (const line of raw.split('\n')) {
@@ -73,31 +179,62 @@ export function formatResourceUsageReport(raw: string): string {
       fields[line.slice(0, idx).trim()] = line.slice(idx + 1).trim()
     }
   }
+  const count = (key: string): number | undefined =>
+    fields[key] !== undefined && /^\d+$/.test(fields[key])
+      ? Number(fields[key])
+      : undefined
 
-  const memPeak = Number(fields['mem_peak'])
+  const cgroupPeak = count('mem_peak')
+  const heldPeak = count('held_peak')
+  const wsPeak = count('ws_peak')
   // cgroup v1 reports an unlimited memory limit as a huge sentinel; treat
   // anything implausibly large (or the v2 literal "max") as "no limit".
-  const memLimitRaw = fields['mem_limit']
-  const memLimit = Number(memLimitRaw)
-  const hasLimit =
-    Number.isFinite(memLimit) &&
-    memLimitRaw !== 'max' &&
-    memLimit < 1024 ** 5 // < 1Pi → a real limit
+  const memLimit = count('mem_limit')
+  const hasLimit = memLimit !== undefined && memLimit < 1024 ** 5 // < 1Pi
 
-  let memMsg: string
-  if (Number.isFinite(memPeak)) {
-    const peakStr = formatBytes(memPeak)
-    if (hasLimit) {
-      const pct = Math.round((memPeak / memLimit) * 100)
-      memMsg = `peak memory: ${peakStr} / ${formatBytes(memLimit)} limit (${pct}%)`
-    } else {
-      memMsg = `peak memory: ${peakStr} (no limit)`
-    }
-  } else {
-    memMsg = 'peak memory: n/a (no cgroup peak counter on this kernel)'
+  const against = (peak: number): string =>
+    hasLimit
+      ? `${formatBytes(peak)} / ${formatBytes(memLimit)} limit (${Math.round((peak / memLimit) * 100)}%)`
+      : `${formatBytes(peak)} (no limit)`
+
+  // How the cgroup met its limit: each `max` event is the kernel reclaiming
+  // (the page cache first) to stay under it, each OOM kill a process lost.
+  const events: string[] = []
+  const maxEvents = count('mem_max_events')
+  const oomKills = count('oom_kills')
+  if (maxEvents) {
+    events.push(`the limit reached ${maxEvents} times`)
+  }
+  if (oomKills !== undefined) {
+    events.push(`${oomKills} OOM kill${oomKills === 1 ? '' : 's'}`)
   }
 
-  let cpuMsg = ''
+  const parts: string[] = []
+  if (heldPeak !== undefined) {
+    parts.push(`peak memory: ${against(heldPeak)} held, page cache left out`)
+    if (wsPeak !== undefined) {
+      parts.push(`working set peak: ${formatBytes(wsPeak)}`)
+    }
+    if (cgroupPeak !== undefined) {
+      parts.push(
+        [`with the page cache: ${formatBytes(cgroupPeak)}`, ...events].join(
+          ', '
+        )
+      )
+    } else if (events.length) {
+      parts.push(events.join(', '))
+    }
+  } else if (cgroupPeak !== undefined) {
+    parts.push(
+      [
+        `peak memory: ${against(cgroupPeak)} page cache included`,
+        ...events
+      ].join(', ')
+    )
+  } else {
+    parts.push('peak memory: n/a (no cgroup peak counter on this kernel)')
+  }
+
   const cpuSec =
     fields['cpu_usec'] && fields['cpu_usec'] !== 'na'
       ? Number(fields['cpu_usec']) / 1e6
@@ -105,10 +242,10 @@ export function formatResourceUsageReport(raw: string): string {
         ? Number(fields['cpu_nsec']) / 1e9
         : NaN
   if (Number.isFinite(cpuSec)) {
-    cpuMsg = ` | cpu: ${Math.round(cpuSec * 10) / 10}s total`
+    parts.push(`cpu: ${Math.round(cpuSec * 10) / 10}s total`)
   }
 
-  return `${memMsg}${cpuMsg}`
+  return parts.join(' | ')
 }
 
 // Human-readable bytes (binary units). Returns undefined for non-finite input.
@@ -173,8 +310,7 @@ export function buildWorkVolume(): k8s.V1Volume {
 
 export const ENV_NODE_PIN_FROM_PR_LABEL =
   'ACTIONS_RUNNER_NODE_PIN_FROM_PR_LABEL'
-export const ENV_NODE_PIN_LABEL_PREFIX =
-  'ACTIONS_RUNNER_NODE_PIN_LABEL_PREFIX'
+export const ENV_NODE_PIN_LABEL_PREFIX = 'ACTIONS_RUNNER_NODE_PIN_LABEL_PREFIX'
 export const DEFAULT_NODE_PIN_LABEL_PREFIX = 'ci:node:'
 // Workflow-facing env key (set in the workflow's `container.env`, like
 // K8S_JOB_RESOURCES). Carries the node name resolved from the PR label by the
