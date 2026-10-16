@@ -16,7 +16,8 @@ import {
   getPrepareJobTimeoutSeconds,
   execCpToPod,
   execPodStep,
-  logPodPlacement
+  logPodPlacement,
+  startResourceUsageSampler
 } from '../k8s'
 import {
   clearStaleTempCommand,
@@ -29,6 +30,7 @@ import {
   mergeContainerWithOptions,
   parseJobResourcesFromEnv,
   readExtensionFromFile,
+  reportResourceUsageEnabled,
   PodPhase,
   fixArgs,
   prepareJobScript
@@ -150,6 +152,12 @@ export async function prepareJob(
   }
 
   await logPodPlacement(createdPod.metadata.name)
+
+  // From here on the job's memory is sampled for the cleanup's usage report:
+  // the cgroup's own peak is no measure of it, the page cache is in it.
+  if (reportResourceUsageEnabled()) {
+    await startResourceUsageSampler(createdPod.metadata.name)
+  }
 
   // A persistent work volume keeps /__w/_temp from earlier jobs. Start from a
   // clean _temp like the runner does; best-effort, a failure only costs speed.

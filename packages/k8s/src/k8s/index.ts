@@ -23,6 +23,8 @@ import {
   buildWorkVolume,
   skipCpHashVerify,
   formatResourceUsageReport,
+  usageReadCommand,
+  usageSamplerStartCommand,
   getNodePinFromPrLabel,
   getNodePinFromEnvList,
   createStringSink,
@@ -1240,24 +1242,33 @@ async function execPodCaptureStdout(
   return output
 }
 
-// Read the job container's cgroup peak memory (and cumulative CPU) and log it
-// against the configured limit. Must be called while the container is still
-// alive (i.e. before prunePods). Best-effort: any failure is swallowed with a
-// debug note so it can never break job cleanup. Supports cgroup v2 (modern,
-// memory.peak) and v1 (memory.max_usage_in_bytes), with a graceful "n/a" when
-// the kernel exposes no peak counter.
+// Start the job container's memory sampler (see usageSampleCommand), right
+// after the pod comes online. Best-effort: a failure costs the report only its
+// page-cache-free peak, never the job.
+export async function startResourceUsageSampler(
+  podName: string
+): Promise<void> {
+  try {
+    await execPodCaptureStdout(
+      ['sh', '-c', usageSamplerStartCommand()],
+      podName,
+      JOB_CONTAINER_NAME
+    )
+  } catch (err) {
+    core.debug(
+      `[usage] could not start the memory sampler: ${(err as Error)?.message ?? err}`
+    )
+  }
+}
+
+// Read what the job container used, the sampler's peaks with the cgroup's own,
+// and log it against the configured limit. Must be called while the container
+// is still alive (i.e. before prunePods). Best-effort: any failure is swallowed
+// with a debug note so it can never break job cleanup. Supports cgroup v2 and
+// v1 (memory.max_usage_in_bytes), with a graceful "n/a" when the kernel
+// exposes no peak counter.
 export async function reportPeakResourceUsage(podName: string): Promise<void> {
-  const script = `
-if [ -r /sys/fs/cgroup/memory.peak ]; then echo "mem_peak=$(cat /sys/fs/cgroup/memory.peak)"; \
-elif [ -r /sys/fs/cgroup/memory/memory.max_usage_in_bytes ]; then echo "mem_peak=$(cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes)"; \
-else echo "mem_peak=na"; fi
-if [ -r /sys/fs/cgroup/memory.max ]; then echo "mem_limit=$(cat /sys/fs/cgroup/memory.max)"; \
-elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then echo "mem_limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)"; \
-else echo "mem_limit=na"; fi
-if [ -r /sys/fs/cgroup/cpu.stat ]; then echo "cpu_usec=$(awk '/^usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat)"; \
-elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then echo "cpu_nsec=$(cat /sys/fs/cgroup/cpuacct/cpuacct.usage)"; \
-else echo "cpu_usec=na"; fi
-`
+  const script = usageReadCommand()
   let raw: string
   try {
     raw = await execPodCaptureStdout(
