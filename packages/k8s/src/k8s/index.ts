@@ -38,7 +38,8 @@ import {
 import * as shlex from 'shlex'
 import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
 import type { HeartbeatWebSocket } from './heartbeat'
-import { logRunnerPlacement } from './placement'
+import { logPodTimes, logRunnerPlacement } from './placement'
+import { waitForPod } from './pod-wait'
 
 const kc = new k8s.KubeConfig()
 
@@ -889,88 +890,21 @@ export async function pruneSecrets(): Promise<void> {
   )
 }
 
+// Wait until the pod is in one of `awaitingPhases`, reading it at a steady
+// pace (see pod-wait.ts): the hook sees it run within a second of it running.
 export async function waitForPodPhases(
   podName: string,
   awaitingPhases: Set<PodPhase>,
   backOffPhases: Set<PodPhase>,
   maxTimeSeconds = DEFAULT_WAIT_FOR_POD_TIME_SECONDS
 ): Promise<void> {
-  const backOffManager = new BackOffManager(maxTimeSeconds)
-  let phase: PodPhase = PodPhase.UNKNOWN
-  let lastProgress = ''
-  try {
-    while (true) {
-      phase = await getPodPhase(podName)
-      if (awaitingPhases.has(phase)) {
-        core.info(`Pod ${podName} reached phase ${phase}`)
-        return
-      }
-
-      if (!backOffPhases.has(phase)) {
-        throw new Error(
-          `Pod ${podName} is unhealthy with phase status ${phase}`
-        )
-      }
-      lastProgress = await logPodProgress(podName, phase, lastProgress)
-      await backOffManager.backOff()
-    }
-  } catch (error) {
-    throw new Error(
-      `Pod ${podName} is unhealthy with phase status ${phase}: ${formatError(error)}`
-    )
-  }
-}
-
-// Emit a concise, human-readable line about what each (init)container is doing
-// while the pod is not yet ready — image being pulled, waiting reason/message
-// (ContainerCreating, ImagePullBackOff, ...), or running/terminated state.
-// Surfaces image-pull progress and stalls on the GitHub Actions UI. Only logs
-// when the message changes from the previous poll to avoid spamming.
-async function logPodProgress(
-  podName: string,
-  phase: PodPhase,
-  last: string
-): Promise<string> {
-  try {
-    const pod = await k8sApi.readNamespacedPod({
-      name: podName,
-      namespace: namespace()
-    })
-    const lines: string[] = []
-    const describe = (
-      statuses: k8s.V1ContainerStatus[] | undefined,
-      kind: string
-    ): void => {
-      for (const cs of statuses || []) {
-        const state = cs.state || {}
-        if (state.waiting) {
-          const reason = state.waiting.reason || 'Waiting'
-          const detail = state.waiting.message ? ` - ${state.waiting.message}` : ''
-          lines.push(`${kind} ${cs.name} [${cs.image}]: ${reason}${detail}`)
-        } else if (state.running) {
-          lines.push(`${kind} ${cs.name} [${cs.image}]: Running`)
-        } else if (state.terminated) {
-          lines.push(
-            `${kind} ${cs.name} [${cs.image}]: Terminated (${state.terminated.reason})`
-          )
-        }
-      }
-    }
-    describe(pod.status?.initContainerStatuses, 'init')
-    describe(pod.status?.containerStatuses, 'container')
-
-    const msg =
-      `Waiting for pod ${podName} (phase ${phase})` +
-      (lines.length ? `\n  ${lines.join('\n  ')}` : '')
-    if (msg !== last) {
-      core.info(msg)
-      return msg
-    }
-    return last
-  } catch {
-    // Status read is best-effort; never let logging break the wait loop.
-    return last
-  }
+  await waitForPod(
+    getPodByName,
+    podName,
+    awaitingPhases,
+    backOffPhases,
+    maxTimeSeconds
+  )
 }
 
 export function getPrepareJobTimeoutSeconds(): number {
@@ -990,25 +924,6 @@ export function getPrepareJobTimeoutSeconds(): number {
   }
 
   return timeoutSeconds
-}
-
-async function getPodPhase(name: string): Promise<PodPhase> {
-  const podPhaseLookup = new Set<string>([
-    PodPhase.PENDING,
-    PodPhase.RUNNING,
-    PodPhase.SUCCEEDED,
-    PodPhase.FAILED,
-    PodPhase.UNKNOWN
-  ])
-  const pod = await k8sApi.readNamespacedPod({
-    name,
-    namespace: namespace()
-  })
-
-  if (!pod.status?.phase || !podPhaseLookup.has(pod.status.phase)) {
-    return PodPhase.UNKNOWN
-  }
-  return pod.status?.phase as PodPhase
 }
 
 async function isJobSucceeded(name: string): Promise<boolean> {
@@ -1302,16 +1217,18 @@ export async function getPvcVolumeName(
 }
 
 // Tell the user where the job runs: the node the runner pod and the job pod
-// landed on and, with a persistent work volume, which PV backs /__w (it is
-// reused across jobs, which explains files left over from earlier runs).
-// Best-effort, never fatal.
+// landed on, when the job pod got there by its own times and, with a
+// persistent work volume, which PV backs /__w (it is reused across jobs, which
+// explains files left over from earlier runs). Best-effort, never fatal.
 export async function logPodPlacement(podName: string): Promise<void> {
   await logRunnerPlacement(getPodByName)
   try {
-    const node = (await getPodByName(podName)).spec?.nodeName
+    const pod = await getPodByName(podName)
+    const node = pod.spec?.nodeName
     if (node) {
       core.info(`Job pod ${podName} is running on node ${node}`)
     }
+    logPodTimes(pod, JOB_CONTAINER_NAME)
   } catch (err) {
     core.debug(`Could not read the node of pod ${podName}: ${formatError(err)}`)
   }

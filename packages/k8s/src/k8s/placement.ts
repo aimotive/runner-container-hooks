@@ -47,3 +47,129 @@ export async function logRunnerPlacement(
   }
   return undefined
 }
+
+// When a job's pod got to its work, by the pod's own times: the API server's
+// for its creation, the scheduler's for its node, the kubelet's for its
+// containers. The hooks measure none of it: they read the pod's status once it
+// runs and print one line, for a reader (or the workflow dashboard) to split
+// the job's start by:
+//   [pod] created=<RFC3339> scheduled=<RFC3339> init_started=<RFC3339> initialized=<RFC3339> started=<RFC3339>
+// A time the pod does not have is left out. A pod that had no node at first
+// says why after a bar, in the scheduler's words:
+//   [pod] created=… started=… | Unschedulable: 0/31 nodes are available: …
+
+type Moment = Date | string | undefined
+
+interface ContainerTimes {
+  name: string
+  state?: {
+    running?: { startedAt?: Moment }
+    terminated?: { startedAt?: Moment }
+  }
+}
+
+// What of a pod the line is made of: a V1Pod, or as much of one.
+export interface PodTimes {
+  metadata?: { name?: string; creationTimestamp?: Moment }
+  status?: {
+    conditions?: {
+      type: string
+      status: string
+      lastTransitionTime?: Moment
+      reason?: string
+      message?: string
+    }[]
+    initContainerStatuses?: ContainerTimes[]
+    containerStatuses?: ContainerTimes[]
+  }
+}
+
+// Why a pod has no node: its PodScheduled condition, while that is false.
+export interface PodHeld {
+  reason: string
+  message: string
+}
+
+const HELD_MESSAGE_LENGTH = 300
+const held = new Map<string, PodHeld>()
+
+// Remember why a pod waits for a node, each time it is read while it waits:
+// its condition says so only until the pod has one.
+export function notePodHeld(pod: PodTimes): void {
+  const name = pod.metadata?.name
+  const scheduled = pod.status?.conditions?.find(c => c.type === 'PodScheduled')
+  if (!name || scheduled?.status !== 'False' || !scheduled.reason) {
+    return
+  }
+  held.set(name, {
+    reason: scheduled.reason,
+    message: (scheduled.message || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, HELD_MESSAGE_LENGTH)
+  })
+}
+
+export function podHeld(name: string | undefined): PodHeld | undefined {
+  return name ? held.get(name) : undefined
+}
+
+// A Kubernetes time as the API writes it, to the second: 2026-11-10T12:00:03Z
+function rfc3339(moment: Moment): string | undefined {
+  if (!moment) {
+    return undefined
+  }
+  const date = moment instanceof Date ? moment : new Date(moment)
+  return isNaN(date.getTime())
+    ? undefined
+    : date.toISOString().replace(/\.\d+Z$/, 'Z')
+}
+
+export function podTimesLine(
+  pod: PodTimes,
+  jobContainer: string,
+  wasHeld: PodHeld | undefined = podHeld(pod.metadata?.name)
+): string | undefined {
+  const turned = (type: string): Moment =>
+    pod.status?.conditions?.find(c => c.type === type && c.status === 'True')
+      ?.lastTransitionTime
+  // The first of its init containers to start: these times compare as text.
+  const initStarted = (pod.status?.initContainerStatuses || [])
+    .map(c =>
+      rfc3339(c.state?.terminated?.startedAt ?? c.state?.running?.startedAt)
+    )
+    .reduce(
+      (first, at) => (at && (!first || at < first) ? at : first),
+      undefined
+    )
+  const job = pod.status?.containerStatuses?.find(c => c.name === jobContainer)
+  const times = [
+    ['created', rfc3339(pod.metadata?.creationTimestamp)],
+    ['scheduled', rfc3339(turned('PodScheduled'))],
+    ['init_started', initStarted],
+    ['initialized', rfc3339(turned('Initialized'))],
+    ['started', rfc3339(job?.state?.running?.startedAt)]
+  ].filter(([, at]) => at)
+  if (!times.length) {
+    return undefined
+  }
+  return (
+    `[pod] ${times.map(([key, at]) => `${key}=${at}`).join(' ')}` +
+    (wasHeld
+      ? ` | ${wasHeld.reason}${wasHeld.message ? `: ${wasHeld.message}` : ''}`
+      : '')
+  )
+}
+
+// Print the pod's times, once it runs. Best-effort like the rest: a pod that
+// says nothing, or something unexpected, costs the line and never the job.
+export function logPodTimes(pod: PodTimes, jobContainer: string): void {
+  try {
+    const line = podTimesLine(pod, jobContainer)
+    if (line) {
+      core.info(line)
+    }
+  } catch (err) {
+    core.debug(`Could not read the times of the job pod: ${formatError(err)}`)
+  }
+}
