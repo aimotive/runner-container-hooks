@@ -9,9 +9,13 @@
 # pod, whose node nothing else records. It asks the Kubernetes API for the runner
 # pod (ACTIONS_RUNNER_POD_NAME) with the pod's own service account, through the
 # k8s-novolume hook bundle beside this file. Best-effort: never fails the job.
+#
+# The runner's node24 first, the node the runner runs the hooks with: the bundle
+# needs node 22.19 or newer (its Kubernetes client's undici 8) and does not load
+# under node20.
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 node_bin=""
-for candidate in "${here}/../externals/node20/bin/node" "${here}/../externals/node24/bin/node"; do
+for candidate in "${here}/../externals/node24/bin/node" "${here}/../externals/node20/bin/node"; do
   if [ -x "${candidate}" ]; then
     node_bin="${candidate}"
     break
