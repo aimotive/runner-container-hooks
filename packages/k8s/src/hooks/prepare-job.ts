@@ -15,16 +15,22 @@ import {
   waitForPodPhases,
   getPrepareJobTimeoutSeconds,
   execCpToPod,
-  execPodStep
+  execPodStep,
+  logPodPlacement,
+  startResourceUsageSampler
 } from '../k8s'
 import {
+  clearStaleTempCommand,
   CONTAINER_VOLUMES,
   DEFAULT_CONTAINER_ENTRY_POINT,
   DEFAULT_CONTAINER_ENTRY_POINT_ARGS,
   formatError,
+  formatResourceMap,
   generateContainerName,
   mergeContainerWithOptions,
+  parseJobResourcesFromEnv,
   readExtensionFromFile,
+  reportResourceUsageEnabled,
   PodPhase,
   fixArgs,
   prepareJobScript
@@ -91,6 +97,19 @@ export async function prepareJob(
   }
 
   let createdPod: k8s.V1Pod | undefined = undefined
+  core.info(
+    `Creating workflow pod ${getJobPodName()}` +
+      (container?.image ? ` (job image: ${container.image})` : '') +
+      (services?.length
+        ? `, services: ${services.map(s => s.image).join(', ')}`
+        : '')
+  )
+  if (container) {
+    core.info(
+      `[resources] job container requests: ${formatResourceMap(container.resources?.requests)} | ` +
+        `limits: ${formatResourceMap(container.resources?.limits)}`
+    )
+  }
   try {
     createdPod = await createJobPod(
       getJobPodName(),
@@ -109,8 +128,8 @@ export async function prepareJob(
   if (!createdPod?.metadata?.name) {
     throw new Error('created pod should have metadata.name')
   }
-  core.debug(
-    `Job pod created, waiting for it to come online ${createdPod?.metadata?.name}`
+  core.info(
+    `Workflow pod ${createdPod.metadata.name} created; waiting for it to come online...`
   )
 
   const runnerWorkspace = dirname(process.env.RUNNER_WORKSPACE as string)
@@ -132,7 +151,34 @@ export async function prepareJob(
     throw new Error(`pod failed to come online with error: ${formatError(err)}`)
   }
 
+  await logPodPlacement(createdPod.metadata.name)
+
+  // From here on the job's memory is sampled for the cleanup's usage report:
+  // the cgroup's own peak is no measure of it, the page cache is in it.
+  if (reportResourceUsageEnabled()) {
+    await startResourceUsageSampler(createdPod.metadata.name)
+  }
+
+  // A persistent work volume keeps /__w/_temp from earlier jobs. Start from a
+  // clean _temp like the runner does; best-effort, a failure only costs speed.
+  try {
+    await execPodStep(
+      ['sh', '-c', clearStaleTempCommand('/__w')],
+      createdPod.metadata.name,
+      JOB_CONTAINER_NAME
+    )
+  } catch (err) {
+    core.warning(
+      `Failed to clear stale /__w/_temp in the job pod: ${formatError(err)}`
+    )
+  }
+
+  core.info(`Copying runner workspace (${runnerWorkspace}) into pod /__w ...`)
+  const copyStart = Date.now()
   await execCpToPod(createdPod.metadata.name, runnerWorkspace, '/__w')
+  core.info(
+    `Workspace ready in pod (${((Date.now() - copyStart) / 1000).toFixed(1)}s)`
+  )
 
   if (prepareScript) {
     await execPodStep(
@@ -286,16 +332,21 @@ export function createContainerSpec(
 
   podContainer.volumeMounts = CONTAINER_VOLUMES
 
-  if (!extension) {
-    return podContainer
+  if (extension) {
+    const from = extension.spec?.containers?.find(
+      c => c.name === CONTAINER_EXTENSION_PREFIX + name
+    )
+    if (from) {
+      mergeContainerWithOptions(podContainer, from)
+    }
   }
 
-  const from = extension.spec?.containers?.find(
-    c => c.name === CONTAINER_EXTENSION_PREFIX + name
-  )
-
-  if (from) {
-    mergeContainerWithOptions(podContainer, from)
+  // Optional per-job resource override driven from the workflow (gated by
+  // ACTIONS_RUNNER_ALLOW_JOB_RESOURCES). Applied last so it wins over the
+  // podTemplate $job resources; no-op when disabled/unset.
+  const jobResources = parseJobResourcesFromEnv(container['environmentVariables'])
+  if (jobResources) {
+    podContainer.resources = jobResources
   }
 
   return podContainer
