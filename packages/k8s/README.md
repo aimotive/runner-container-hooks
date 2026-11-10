@@ -45,7 +45,7 @@ Job pod <runner pod>-workflow is running on node <node>
 ```
 
 - "Initialize containers" (`prepare_job`) prints both, for a job with a container.
-- A job without a container runs its steps in the runner pod, and no hook runs for it. `job-started.sh`, set as the runner's job-started hook, covers it: `ACTIONS_RUNNER_HOOK_JOB_STARTED=<dir>/job-started.sh`, with the bundle's `index.js` beside it. Every job's "Set up runner" step then prints the runner pod's line. It runs `index.js job-started`, which reads the runner pod (`ACTIONS_RUNNER_POD_NAME`) with the pod's own service account — the `get pods` the hooks already need — and never fails the job.
+- A job without a container runs its steps in the runner pod, and no hook runs for it. `job-started.sh`, set as the runner's job-started hook, covers it: `ACTIONS_RUNNER_HOOK_JOB_STARTED=<dir>/job-started.sh`, with the bundle's `index.js` beside it. Every job's "Set up runner" step then prints the runner pod's line. It runs `index.js job-started`, which reads the runner pod (`ACTIONS_RUNNER_POD_NAME`) with the pod's own service account — the `get pods` the hooks already need — and never fails the job. It runs it with the runner's node24 (`externals/node24` beside the hooks' directory), as the runner runs the hooks: the bundle needs node 22.19 or newer.
 
 ## When a job's pod got to its work
 
