@@ -47,6 +47,19 @@ Job pod <runner pod>-workflow is running on node <node>
 - "Initialize containers" (`prepare_job`) prints both, for a job with a container.
 - A job without a container runs its steps in the runner pod, and no hook runs for it. `job-started.sh`, set as the runner's job-started hook, covers it: `ACTIONS_RUNNER_HOOK_JOB_STARTED=<dir>/job-started.sh`, with the bundle's `index.js` beside it. Every job's "Set up runner" step then prints the runner pod's line. It runs `index.js job-started`, which reads the runner pod (`ACTIONS_RUNNER_POD_NAME`) with the pod's own service account — the `get pods` the hooks already need — and never fails the job.
 
+## When a job's pod got to its work
+
+"Initialize containers" is one step to GitHub: the wait for a node, the init container and the job image are all in it. Once the job pod runs, `prepare_job` prints the pod's own times after its node, read from its status — the hooks measure none of them:
+
+```
+[pod] created=<RFC3339> scheduled=<RFC3339> init_started=<RFC3339> initialized=<RFC3339> started=<RFC3339>
+```
+
+- `created`: `metadata.creationTimestamp`; `scheduled`: when its `PodScheduled` condition turned true; `init_started`: the first start of its init containers; `initialized`: when its `Initialized` condition turned true; `started`: `state.running.startedAt` of the job container.
+- A time the pod does not have is left out.
+- A pod that had no node at first says why at the end of the line, in the scheduler's words, as it was last seen waiting: ` | Unschedulable: 0/31 nodes are available: …` (one line, cut at 300 characters).
+- A pod that cannot be read costs the line, never the job.
+
 ## Limitations
 - A [job containers](https://docs.github.com/en/actions/using-jobs/running-jobs-in-a-container) will be required for all jobs
 - Building container actions from a dockerfile is not supported at this time

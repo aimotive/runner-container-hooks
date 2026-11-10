@@ -38,7 +38,7 @@ import {
 import * as shlex from 'shlex'
 import { parsePositiveMsEnv, WebSocketHeartbeat } from './heartbeat'
 import type { HeartbeatWebSocket } from './heartbeat'
-import { logRunnerPlacement } from './placement'
+import { logPodTimes, logRunnerPlacement, notePodHeld } from './placement'
 
 const kc = new k8s.KubeConfig()
 
@@ -936,6 +936,7 @@ async function logPodProgress(
       name: podName,
       namespace: namespace()
     })
+    notePodHeld(pod)
     const lines: string[] = []
     const describe = (
       statuses: k8s.V1ContainerStatus[] | undefined,
@@ -1302,16 +1303,18 @@ export async function getPvcVolumeName(
 }
 
 // Tell the user where the job runs: the node the runner pod and the job pod
-// landed on and, with a persistent work volume, which PV backs /__w (it is
-// reused across jobs, which explains files left over from earlier runs).
-// Best-effort, never fatal.
+// landed on, when the job pod got there by its own times and, with a
+// persistent work volume, which PV backs /__w (it is reused across jobs, which
+// explains files left over from earlier runs). Best-effort, never fatal.
 export async function logPodPlacement(podName: string): Promise<void> {
   await logRunnerPlacement(getPodByName)
   try {
-    const node = (await getPodByName(podName)).spec?.nodeName
+    const pod = await getPodByName(podName)
+    const node = pod.spec?.nodeName
     if (node) {
       core.info(`Job pod ${podName} is running on node ${node}`)
     }
+    logPodTimes(pod, JOB_CONTAINER_NAME)
   } catch (err) {
     core.debug(`Could not read the node of pod ${podName}: ${formatError(err)}`)
   }
