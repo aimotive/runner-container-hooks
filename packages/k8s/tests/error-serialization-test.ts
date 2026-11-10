@@ -143,6 +143,25 @@ describe('error serialization', () => {
   })
 
   describe('waitForPodPhases', () => {
+    it('should read the pod once a poll until it runs', async () => {
+      mockReadNamespacedPod
+        .mockResolvedValueOnce({ status: { phase: 'Pending' } })
+        .mockResolvedValueOnce({ status: { phase: 'Pending' } })
+        .mockResolvedValue({ status: { phase: 'Running' } })
+
+      await waitForPodPhases(
+        'test-pod',
+        new Set([PodPhase.RUNNING]),
+        new Set([PodPhase.PENDING])
+      )
+
+      expect(mockReadNamespacedPod).toHaveBeenCalledTimes(3)
+      expect(mockReadNamespacedPod).toHaveBeenCalledWith({
+        name: 'test-pod',
+        namespace: 'test-namespace'
+      })
+    })
+
     it('should include error message when pod enters unhealthy phase', async () => {
       mockReadNamespacedPod.mockResolvedValue({
         status: { phase: 'Failed' }

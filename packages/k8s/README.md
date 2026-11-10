@@ -59,6 +59,7 @@ Job pod <runner pod>-workflow is running on node <node>
 - A time the pod does not have is left out.
 - A pod that had no node at first says why at the end of the line, in the scheduler's words, as it was last seen waiting: ` | Unschedulable: 0/31 nodes are available: …` (one line, cut at 300 characters).
 - A pod that cannot be read costs the line, never the job.
+- While they wait for the pod, the hooks read it once a second (`pod-wait.ts`), so the step ends within a second of the pod running. A watch would need the `watch` verb on pods, which the role above does not have.
 
 ## Limitations
 - A [job containers](https://docs.github.com/en/actions/using-jobs/running-jobs-in-a-container) will be required for all jobs
